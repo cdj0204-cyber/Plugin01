@@ -1,0 +1,12 @@
+# 빌드 산출물 (노트북에서 dotnet build로 재생성)
+bin/
+obj/
+
+# Visual Studio / Rider
+.vs/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store

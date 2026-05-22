@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- 사각형 테두리 -->
+  <rect x="10" y="10" width="180" height="180"/>
+
+  <!-- 원 패턴 (3x3 격자) -->
+  <circle cx="50"  cy="50"  r="15"/>
+  <circle cx="100" cy="50"  r="15"/>
+  <circle cx="150" cy="50"  r="15"/>
+  <circle cx="50"  cy="100" r="15"/>
+  <circle cx="100" cy="100" r="15"/>
+  <circle cx="150" cy="100" r="15"/>
+  <circle cx="50"  cy="150" r="15"/>
+  <circle cx="100" cy="150" r="15"/>
+  <circle cx="150" cy="150" r="15"/>
+
+  <!-- path: 베지어 곡선이 포함된 물결 -->
+  <path d="M 20 100 C 50 60, 80 140, 100 100 S 150 60, 180 100"/>
+
+  <!-- 타원 -->
+  <ellipse cx="100" cy="100" rx="40" ry="25"/>
+
+  <!-- 다각형 (삼각형) -->
+  <polygon points="100,30 130,80 70,80"/>
