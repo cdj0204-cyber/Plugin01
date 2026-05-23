@@ -72,7 +72,8 @@ namespace Plugin01
         public static List<Curve> TileRegion(Surface srf, IList<BrepFace> clipFaces,
                                              Interval uReg, Interval vReg,
                                              IList<Curve> pattern, BoundingBox patternBox,
-                                             int nU, int nV, double sampleChord)
+                                             int nU, int nV, double sampleChord,
+                                             double margin = 0)
         {
             var result = new List<Curve>();
             if (srf == null || pattern == null || pattern.Count == 0) return result;
@@ -83,6 +84,20 @@ namespace Plugin01
 
             nU = Math.Max(1, nU);
             nV = Math.Max(1, nV);
+
+            // 마진 인셋: 외곽선에서 margin mm 안쪽으로 영역을 줄여 패턴을 채움
+            if (margin > 1e-9)
+            {
+                double sw, sh;
+                if (srf.GetSurfaceSize(out sw, out sh) && sw > 1e-9 && sh > 1e-9)
+                {
+                    double insetU = (margin / sw) * uReg.Length;
+                    double insetV = (margin / sh) * vReg.Length;
+                    uReg = new Interval(uReg.T0 + insetU, uReg.T1 - insetU);
+                    vReg = new Interval(vReg.T0 + insetV, vReg.T1 - insetV);
+                    if (uReg.Length <= 1e-9 || vReg.Length <= 1e-9) return result;
+                }
+            }
 
             // 영역이 닫힌 방향의 전체 도메인을 덮을 때만 솔기 간격 보정
             var ud = srf.Domain(0);
@@ -383,6 +398,32 @@ namespace Plugin01
 
         private static Point3d[] SampleCurve(Curve c, double chord)
         {
+            // 폴리라인이면 각 변을 chord로 분할하되 꼭짓점은 정확히 유지 (찌그러짐 방지)
+            var plc = c as PolylineCurve;
+            Polyline pl = null;
+            if (plc != null && plc.TryGetPolyline(out pl) && pl.Count >= 2)
+            {
+                var ptsList = new List<Point3d>();
+                int nv = pl.Count;
+                for (int i = 0; i < nv - 1; i++)
+                {
+                    Point3d a = pl[i];
+                    Point3d b = pl[i + 1];
+                    double edgeLen = a.DistanceTo(b);
+                    int subs = chord > 1e-9 ? Math.Max(1, (int)Math.Ceiling(edgeLen / chord)) : 1;
+                    for (int j = 0; j < subs; j++)
+                    {
+                        double t = (double)j / subs;
+                        ptsList.Add(new Point3d(
+                            a.X + (b.X - a.X) * t,
+                            a.Y + (b.Y - a.Y) * t,
+                            a.Z + (b.Z - a.Z) * t));
+                    }
+                }
+                ptsList.Add(pl[nv - 1]);
+                return ptsList.ToArray();
+            }
+
             double len = c.GetLength();
             int n = chord > 1e-9 ? (int)Math.Ceiling(len / chord) : 12;
             n = Math.Max(6, Math.Min(n, 300));
@@ -481,9 +522,450 @@ namespace Plugin01
             foreach (var kv in phases)
             {
                 var face = brep.Faces[kv.Key];
-                GenerateCellsForFace(brep, face, kv.Value, info, refDir, cellPts, result);
+                GenerateCellsForFace(brep, face, kv.Key, kv.Value, phases, info, refDir, cellPts, result);
             }
             return result;
+        }
+
+        /// <summary>
+        /// "실제 크기" 다면 버전: 셀 크기는 실제 크기 유지, 셀 위치만 영역에 균등 분포해 끝까지 채움.
+        /// (정수 격자 대신 영역 경계까지 닿도록 spacing을 미세 조정)
+        /// </summary>
+        public static List<Curve> TileConnectedRealSizeFit(Brep brep, IList<int> faceIndices,
+                                                            PatternInfo info, Vector3d refDir, double angleTolRad,
+                                                            double rotationDeg = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (info == null || !info.Valid || info.UnitCells.Count == 0) return result;
+
+            // BFS 위상
+            var faceSet = new HashSet<int>(faceIndices);
+            var phases = new Dictionary<int, FacePhase>();
+            var fromMap = new Dictionary<int, int>();
+            var queue = new Queue<int>();
+            int seed = faceIndices[0];
+            queue.Enqueue(seed);
+            fromMap[seed] = -1;
+            while (queue.Count > 0)
+            {
+                int fi = queue.Dequeue();
+                if (phases.ContainsKey(fi)) continue;
+                var face = brep.Faces[fi];
+                FacePhase phase = (fromMap[fi] < 0)
+                    ? MakeSeedPhase(face, refDir)
+                    : MakeChildPhase(face, brep.Faces[fromMap[fi]], phases[fromMap[fi]], brep, fi, fromMap[fi], info, refDir, angleTolRad);
+                if (phase == null) continue;
+                phases[fi] = phase;
+                foreach (int ei in face.AdjacentEdges())
+                {
+                    var edge = brep.Edges[ei];
+                    if (!edge.IsSmoothManifoldEdge(angleTolRad)) continue;
+                    foreach (int nfi in edge.AdjacentFaces())
+                    {
+                        if (nfi != fi && faceSet.Contains(nfi) && !phases.ContainsKey(nfi) && !fromMap.ContainsKey(nfi))
+                        {
+                            fromMap[nfi] = fi;
+                            queue.Enqueue(nfi);
+                        }
+                    }
+                }
+            }
+            if (phases.Count == 0) return result;
+
+            // 전체 격자 bbox
+            double iMinG = double.MaxValue, iMaxG = double.MinValue;
+            double jMinG = double.MaxValue, jMaxG = double.MinValue;
+            foreach (var kv in phases)
+            {
+                var ph = kv.Value;
+                double[] cornU = { ph.UMin, ph.UMax, ph.UMin, ph.UMax };
+                double[] cornV = { ph.VMin, ph.VMin, ph.VMax, ph.VMax };
+                for (int k = 0; k < 4; k++)
+                {
+                    double sU = InterpArcAtParam(ph.UPars, ph.UArcs, cornU[k]) - ph.UAnchorArc;
+                    double sV = InterpArcAtParam(ph.VPars, ph.VArcs, cornV[k]) - ph.VAnchorArc;
+                    double iLoc = (sU * ph.CosA + sV * ph.SinA) / info.PitchU;
+                    double jLoc = (-sU * ph.SinA + sV * ph.CosA) / info.PitchV;
+                    double iVal = iLoc + ph.IOffset;
+                    double jVal = jLoc + ph.JOffset;
+                    if (iVal < iMinG) iMinG = iVal;
+                    if (iVal > iMaxG) iMaxG = iVal;
+                    if (jVal < jMinG) jMinG = jVal;
+                    if (jVal > jMaxG) jMaxG = jVal;
+                }
+            }
+            if (iMinG >= iMaxG || jMinG >= jMaxG) return result;
+
+            // 셀이 경계까지 닿도록 균등 분포 (cell edge가 region edge에 맞도록)
+            double halfI = 0.5 * info.CellW / info.PitchU;
+            double halfJ = 0.5 * info.CellH / info.PitchV;
+            double iSpan = iMaxG - iMinG;
+            double jSpan = jMaxG - jMinG;
+            double effI = Math.Max(0, iSpan - 2 * halfI);
+            double effJ = Math.Max(0, jSpan - 2 * halfJ);
+            // 원본 pitch에 가까운 step이 되도록 cell 개수 결정
+            int nU = Math.Max(1, (int)Math.Round(effI) + 1);
+            int nV = Math.Max(1, (int)Math.Round(effJ) + 1);
+            double stepI = nU > 1 ? effI / (nU - 1) : 0;
+            double stepJ = nV > 1 ? effJ / (nV - 1) : 0;
+
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+            var cellPts = new List<Point3d[]>();
+            foreach (var c in info.UnitCells) cellPts.Add(SampleCurve(c, chord));
+            var unitBBox = BoundingBox.Empty;
+            foreach (var c in info.UnitCells) unitBBox.Union(c.GetBoundingBox(true));
+            double ucX = unitBBox.Center.X, ucY = unitBBox.Center.Y;
+
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+            double absC = Math.Abs(cosR), absS = Math.Abs(sinR);
+            double centerI = 0.5 * (iMinG + iMaxG);
+            double centerJ = 0.5 * (jMinG + jMaxG);
+
+            // 회전 후 원본 영역을 덮도록 소스 격자 영역 확장
+            double iSpanMm = iSpan * info.PitchU;
+            double jSpanMm = jSpan * info.PitchV;
+            double expISpan = (iSpanMm * absC + jSpanMm * absS) / info.PitchU;
+            double expJSpan = (iSpanMm * absS + jSpanMm * absC) / info.PitchV;
+            double effIE = Math.Max(0, expISpan - 2 * halfI);
+            double effJE = Math.Max(0, expJSpan - 2 * halfJ);
+            int nUE = Math.Max(1, (int)Math.Round(effIE) + 1);
+            int nVE = Math.Max(1, (int)Math.Round(effJE) + 1);
+            double stepIE = nUE > 1 ? effIE / (nUE - 1) : 0;
+            double stepJE = nVE > 1 ? effJE / (nVE - 1) : 0;
+            double iMinE = centerI - 0.5 * expISpan;
+            double jMinE = centerJ - 0.5 * expJSpan;
+
+            // 회전이 거의 0이면 원래 그리드 사용 (정확한 가장자리 맞춤)
+            if (Math.Abs(rotationDeg) < 1e-6)
+            {
+                nUE = nU; nVE = nV;
+                stepIE = stepI; stepJE = stepJ;
+                iMinE = iMinG; jMinE = jMinG;
+            }
+
+            for (int ki = 0; ki < nUE; ki++)
+            {
+                for (int kj = 0; kj < nVE; kj++)
+                {
+                    double vi_raw = iMinE + halfI + ki * stepIE;
+                    double vj_raw = jMinE + halfJ + kj * stepJE;
+                    // 영역 중심 기준 회전 (격자 전체가 강체로 회전)
+                    double dxC = (vi_raw - centerI) * info.PitchU;
+                    double dyC = (vj_raw - centerJ) * info.PitchV;
+                    double dxCR = dxC * cosR - dyC * sinR;
+                    double dyCR = dxC * sinR + dyC * cosR;
+                    double vi_c = centerI + dxCR / info.PitchU;
+                    double vj_c = centerJ + dyCR / info.PitchV;
+
+                    foreach (var pts in cellPts)
+                    {
+                        var mapped = new Point3d[pts.Length];
+                        bool ok = true;
+                        for (int k = 0; k < pts.Length; k++)
+                        {
+                            double dx = pts[k].X - ucX;
+                            double dy = pts[k].Y - ucY;
+                            // 셀 자체도 같은 각도로 회전
+                            double dxR = dx * cosR - dy * sinR;
+                            double dyR = dx * sinR + dy * cosR;
+                            double vi = vi_c + dxR / info.PitchU;
+                            double vj = vj_c + dyR / info.PitchV;
+
+                            bool found = false;
+                            foreach (var kv in phases)
+                            {
+                                double u, v;
+                                if (!LatticeToFaceUV(kv.Value, vi, vj, info, out u, out v)) continue;
+                                var f = brep.Faces[kv.Key];
+                                if (f.IsPointOnFace(u, v) != PointFaceRelation.Exterior)
+                                {
+                                    mapped[k] = ((Surface)f).PointAt(u, v);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) { ok = false; break; }
+                        }
+                        if (ok)
+                        {
+                            var crv = new PolylineCurve(mapped);
+                            if (crv.IsValid) result.Add(crv);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// "실제 크기 - 패턴 부분적용": 패턴 N개를 실제 크기로 표면 위에 한 묶음 올리고
+        /// 사용자가 U/V 오프셋(mm)과 회전(도)으로 위치를 자유롭게 잡는다.
+        /// </summary>
+        public static List<Curve> TileConnectedPartial(Brep brep, IList<int> faceIndices,
+                                                       IList<Curve> patternCurves, BoundingBox patternBox,
+                                                       Vector3d refDir, double angleTolRad,
+                                                       double uOffsetMm, double vOffsetMm, double rotationDeg)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (patternCurves == null || patternCurves.Count == 0) return result;
+
+            var info = PatternAnalyzer.Analyze(patternCurves);
+            if (!info.Valid) return result;
+
+            // BFS 위상 (다른 메서드와 동일)
+            var faceSet = new HashSet<int>(faceIndices);
+            var phases = new Dictionary<int, FacePhase>();
+            var fromMap = new Dictionary<int, int>();
+            var queue = new Queue<int>();
+            int seed = faceIndices[0];
+            queue.Enqueue(seed);
+            fromMap[seed] = -1;
+            while (queue.Count > 0)
+            {
+                int fi = queue.Dequeue();
+                if (phases.ContainsKey(fi)) continue;
+                var face = brep.Faces[fi];
+                FacePhase phase = (fromMap[fi] < 0)
+                    ? MakeSeedPhase(face, refDir)
+                    : MakeChildPhase(face, brep.Faces[fromMap[fi]], phases[fromMap[fi]], brep, fi, fromMap[fi], info, refDir, angleTolRad);
+                if (phase == null) continue;
+                phases[fi] = phase;
+                foreach (int ei in face.AdjacentEdges())
+                {
+                    var edge = brep.Edges[ei];
+                    if (!edge.IsSmoothManifoldEdge(angleTolRad)) continue;
+                    foreach (int nfi in edge.AdjacentFaces())
+                    {
+                        if (nfi != fi && faceSet.Contains(nfi) && !phases.ContainsKey(nfi) && !fromMap.ContainsKey(nfi))
+                        {
+                            fromMap[nfi] = fi;
+                            queue.Enqueue(nfi);
+                        }
+                    }
+                }
+            }
+            if (phases.Count == 0) return result;
+
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+            double pCx = 0.5 * (patternBox.Min.X + patternBox.Max.X);
+            double pCy = 0.5 * (patternBox.Min.Y + patternBox.Max.Y);
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+
+            foreach (var c in patternCurves)
+            {
+                var pts = SampleCurve(c, chord);
+                var mapped = new Point3d[pts.Length];
+                bool ok = true;
+                for (int k = 0; k < pts.Length; k++)
+                {
+                    // 패턴 중심 기준 오프셋
+                    double dx = pts[k].X - pCx;
+                    double dy = pts[k].Y - pCy;
+                    // 회전
+                    double rx = dx * cosR - dy * sinR;
+                    double ry = dx * sinR + dy * cosR;
+                    // 평행이동 (mm = arc-length)
+                    rx += uOffsetMm;
+                    ry += vOffsetMm;
+                    // 격자 좌표 (seed = (0, 0))
+                    double vi = rx / info.PitchU;
+                    double vj = ry / info.PitchV;
+
+                    bool found = false;
+                    foreach (var kv in phases)
+                    {
+                        double u, v;
+                        if (!LatticeToFaceUV(kv.Value, vi, vj, info, out u, out v)) continue;
+                        var f = brep.Faces[kv.Key];
+                        if (f.IsPointOnFace(u, v) != PointFaceRelation.Exterior)
+                        {
+                            mapped[k] = ((Surface)f).PointAt(u, v);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) { ok = false; break; }
+                }
+                if (ok)
+                {
+                    var crv = new PolylineCurve(mapped);
+                    if (crv.IsValid) result.Add(crv);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// "한 장 늘려 맞춤" 다면 버전: 패턴 커브 N개를 그대로 발생시켜 영역에 매핑한다.
+        /// BFS 위상으로 격자를 만들고, 패턴 bbox -> 영역 격자 bbox(균일 스케일)로 매핑.
+        /// 결과 셀 수 = 패턴 커브 수 (모두 영역 안에 들어가는 경우).
+        /// </summary>
+        public static List<Curve> TileConnectedStretch(Brep brep, IList<int> faceIndices,
+                                                       IList<Curve> patternCurves, BoundingBox patternBox,
+                                                       Vector3d refDir, double angleTolRad,
+                                                       int nU = 1, int nV = 1, double margin = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (patternCurves == null || patternCurves.Count == 0) return result;
+
+            var info = PatternAnalyzer.Analyze(patternCurves);
+            if (!info.Valid) return result;
+
+            // BFS 위상 (TileConnected와 동일)
+            var faceSet = new HashSet<int>(faceIndices);
+            var phases = new Dictionary<int, FacePhase>();
+            var fromMap = new Dictionary<int, int>();
+            var queue = new Queue<int>();
+            int seed = faceIndices[0];
+            queue.Enqueue(seed);
+            fromMap[seed] = -1;
+
+            while (queue.Count > 0)
+            {
+                int fi = queue.Dequeue();
+                if (phases.ContainsKey(fi)) continue;
+                var face = brep.Faces[fi];
+
+                FacePhase phase;
+                if (fromMap[fi] < 0)
+                    phase = MakeSeedPhase(face, refDir);
+                else
+                    phase = MakeChildPhase(face, brep.Faces[fromMap[fi]], phases[fromMap[fi]], brep, fi, fromMap[fi], info, refDir, angleTolRad);
+
+                if (phase == null) continue;
+                phases[fi] = phase;
+
+                foreach (int ei in face.AdjacentEdges())
+                {
+                    var edge = brep.Edges[ei];
+                    if (!edge.IsSmoothManifoldEdge(angleTolRad)) continue;
+                    foreach (int nfi in edge.AdjacentFaces())
+                    {
+                        if (nfi != fi && faceSet.Contains(nfi) && !phases.ContainsKey(nfi) && !fromMap.ContainsKey(nfi))
+                        {
+                            fromMap[nfi] = fi;
+                            queue.Enqueue(nfi);
+                        }
+                    }
+                }
+            }
+
+            if (phases.Count == 0) return result;
+
+            // 전체 격자 bbox (fractional)
+            double iMinG = double.MaxValue, iMaxG = double.MinValue;
+            double jMinG = double.MaxValue, jMaxG = double.MinValue;
+            foreach (var kv in phases)
+            {
+                var ph = kv.Value;
+                double[] cornU = { ph.UMin, ph.UMax, ph.UMin, ph.UMax };
+                double[] cornV = { ph.VMin, ph.VMin, ph.VMax, ph.VMax };
+                for (int k = 0; k < 4; k++)
+                {
+                    double sU = InterpArcAtParam(ph.UPars, ph.UArcs, cornU[k]) - ph.UAnchorArc;
+                    double sV = InterpArcAtParam(ph.VPars, ph.VArcs, cornV[k]) - ph.VAnchorArc;
+                    double iLoc = (sU * ph.CosA + sV * ph.SinA) / info.PitchU;
+                    double jLoc = (-sU * ph.SinA + sV * ph.CosA) / info.PitchV;
+                    double iVal = iLoc + ph.IOffset;
+                    double jVal = jLoc + ph.JOffset;
+                    if (iVal < iMinG) iMinG = iVal;
+                    if (iVal > iMaxG) iMaxG = iVal;
+                    if (jVal < jMinG) jMinG = jVal;
+                    if (jVal > jMaxG) jMaxG = jVal;
+                }
+            }
+            if (iMinG >= iMaxG || jMinG >= jMaxG) return result;
+
+            // 마진 인셋: 외곽선에서 margin mm 안쪽으로 격자 영역을 줄임
+            if (margin > 1e-9)
+            {
+                double mi = margin / info.PitchU;
+                double mj = margin / info.PitchV;
+                iMinG += mi; iMaxG -= mi;
+                jMinG += mj; jMaxG -= mj;
+                if (iMinG >= iMaxG || jMinG >= jMaxG) return result;
+            }
+
+            double pw = patternBox.Max.X - patternBox.Min.X;
+            double ph2 = patternBox.Max.Y - patternBox.Min.Y;
+            if (pw < 1e-9 || ph2 < 1e-9) return result;
+
+            // 비균일 스케일 + nU x nV 반복 (반복 사이에 패턴 내부 간격과 동일한 갭 유지)
+            nU = Math.Max(1, nU);
+            nV = Math.Max(1, nV);
+            double iSpan = iMaxG - iMinG;
+            double jSpan = jMaxG - jMinG;
+
+            // 패턴 내부 인접 셀 사이 간격 (반복 사이 간격으로 사용)
+            double gapX = nU > 1 ? EstimateGap(patternCurves, 0) : 0;
+            double gapY = nV > 1 ? EstimateGap(patternCurves, 1) : 0;
+            double effSpanU = nU * pw + (nU - 1) * gapX;
+            double effSpanV = nV * ph2 + (nV - 1) * gapY;
+
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+
+            for (int ti = 0; ti < nU; ti++)
+            {
+                for (int tj = 0; tj < nV; tj++)
+                {
+                    foreach (var c in patternCurves)
+                    {
+                        var pts = SampleCurve(c, chord);
+                        var mapped = new Point3d[pts.Length];
+                        bool ok = true;
+                        for (int k = 0; k < pts.Length; k++)
+                        {
+                            double gx = ti * (pw + gapX) + (pts[k].X - patternBox.Min.X);
+                            double gy = tj * (ph2 + gapY) + (pts[k].Y - patternBox.Min.Y);
+                            double vi = iMinG + gx / effSpanU * iSpan;
+                            double vj = jMinG + gy / effSpanV * jSpan;
+
+                            bool found = false;
+                            foreach (var kv in phases)
+                            {
+                                double u2, v2;
+                                if (!LatticeToFaceUV(kv.Value, vi, vj, info, out u2, out v2)) continue;
+                                var f2 = brep.Faces[kv.Key];
+                                if (f2.IsPointOnFace(u2, v2) != PointFaceRelation.Exterior)
+                                {
+                                    mapped[k] = ((Surface)f2).PointAt(u2, v2);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found) { ok = false; break; }
+                        }
+                        if (ok)
+                        {
+                            var crv = new PolylineCurve(mapped);
+                            if (crv.IsValid) result.Add(crv);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
+        // 격자 좌표 (vi, vj) -> 특정 면의 UV (있으면 true)
+        private static bool LatticeToFaceUV(FacePhase ph, double vi, double vj, PatternInfo info, out double u, out double v)
+        {
+            u = 0; v = 0;
+            double iLoc = vi - ph.IOffset;
+            double jLoc = vj - ph.JOffset;
+            double sU = iLoc * info.PitchU * ph.CosA - jLoc * info.PitchV * ph.SinA;
+            double sV = iLoc * info.PitchU * ph.SinA + jLoc * info.PitchV * ph.CosA;
+            double targetUArc = ph.UAnchorArc + sU;
+            double targetVArc = ph.VAnchorArc + sV;
+            if (targetUArc < ph.UArcs[0] - 1e-6 || targetUArc > ph.UArcs[ph.UArcs.Length - 1] + 1e-6) return false;
+            if (targetVArc < ph.VArcs[0] - 1e-6 || targetVArc > ph.VArcs[ph.VArcs.Length - 1] + 1e-6) return false;
+            u = InterpParam(ph.UArcs, ph.UPars, targetUArc);
+            v = InterpParam(ph.VArcs, ph.VPars, targetVArc);
+            return true;
         }
 
         private static FacePhase MakeSeedPhase(BrepFace face, Vector3d refDir)
@@ -635,7 +1117,9 @@ namespace Plugin01
             catch { }
         }
 
-        private static void GenerateCellsForFace(Brep brep, BrepFace face, FacePhase ph, PatternInfo info,
+        private static void GenerateCellsForFace(Brep brep, BrepFace face, int faceIndex, FacePhase ph,
+                                                  Dictionary<int, FacePhase> phases,
+                                                  PatternInfo info,
                                                   Vector3d refDir, List<Point3d[]> cellPts, List<Curve> outResult)
         {
             // 면 위에서 셀 i, j 범위 추정: UV 박스 모서리들의 lattice 좌표 범위
@@ -687,32 +1171,62 @@ namespace Plugin01
                     double lu = du.Length, lv = dv.Length;
                     if (lu < 1e-9 || lv < 1e-9) continue;
 
-                    double cosA, sinA;
-                    ComputeRotation(du, dv, lu, lv, refDir, out cosA, out sinA);
-
                     var duHat = du / lu;
                     var dvHat = dv / lv;
+
                     foreach (var pts in cellPts)
                     {
                         var mapped = new Point3d[pts.Length];
                         for (int k = 0; k < pts.Length; k++)
                         {
-                            double rx = pts[k].X * cosA - pts[k].Y * sinA;
-                            double ry = pts[k].X * sinA + pts[k].Y * cosA;
-                            double uu = u + rx / lu;
-                            double vv = v + ry / lv;
-                            // 현재 면 트림 안에 있으면 그 면에서 평가, 밖이면 인접 면으로 넘어가도록 브렙 스냅
-                            if (face.IsPointOnFace(uu, vv) != PointFaceRelation.Exterior)
+                            // 꼭짓점의 (refDir, perp) 오프셋 -> (U_arc, V_arc) 회전
+                            double sUoff = pts[k].X * ph.CosA - pts[k].Y * ph.SinA;
+                            double sVoff = pts[k].X * ph.SinA + pts[k].Y * ph.CosA;
+                            double tUArc = ph.UAnchorArc + sU + sUoff;
+                            double tVArc = ph.VAnchorArc + sV + sVoff;
+
+                            bool placed = false;
+                            // 1) 현재 면 호 길이 테이블로 직접 조회 (곡률 무관 균일 셀 크기)
+                            if (tUArc >= ph.UArcs[0] - 1e-6 && tUArc <= ph.UArcs[ph.UArcs.Length - 1] + 1e-6 &&
+                                tVArc >= ph.VArcs[0] - 1e-6 && tVArc <= ph.VArcs[ph.VArcs.Length - 1] + 1e-6)
                             {
-                                vv = Math.Min(vd.T1, Math.Max(vd.T0, vv));
-                                uu = Math.Min(ud.T1, Math.Max(ud.T0, uu));
-                                mapped[k] = srf.PointAt(uu, vv);
+                                double uu = InterpParam(ph.UArcs, ph.UPars, tUArc);
+                                double vv = InterpParam(ph.VArcs, ph.VPars, tVArc);
+                                if (face.IsPointOnFace(uu, vv) != PointFaceRelation.Exterior)
+                                {
+                                    mapped[k] = srf.PointAt(uu, vv);
+                                    placed = true;
+                                }
                             }
-                            else
+
+                            if (!placed)
                             {
-                                var tangentPos = s0 + rx * duHat + ry * dvHat;
-                                Point3d cp; ComponentIndex ci; double cs, ct; Vector3d nrm;
-                                if (brep.ClosestPoint(tangentPos, out cp, out ci, out cs, out ct, double.MaxValue, out nrm))
+                                // 2) 격자 좌표로 인접 면 조회
+                                double vi = gi + pts[k].X / info.PitchU;
+                                double vj = gj + pts[k].Y / info.PitchV;
+                                foreach (var kv2 in phases)
+                                {
+                                    if (kv2.Key == faceIndex) continue;
+                                    double u2, v2;
+                                    if (!LatticeToFaceUV(kv2.Value, vi, vj, info, out u2, out v2)) continue;
+                                    var f2 = brep.Faces[kv2.Key];
+                                    if (f2.IsPointOnFace(u2, v2) != PointFaceRelation.Exterior)
+                                    {
+                                        mapped[k] = ((Surface)f2).PointAt(u2, v2);
+                                        placed = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (!placed)
+                            {
+                                // 3) 최후 폴백: 접선 외삽 → 브렙 가장 가까운 점
+                                double rxT = pts[k].X * ph.CosA - pts[k].Y * ph.SinA;
+                                double ryT = pts[k].X * ph.SinA + pts[k].Y * ph.CosA;
+                                var tangentPos = s0 + rxT * duHat + ryT * dvHat;
+                                Point3d cp; ComponentIndex ci; double cs2, ct2; Vector3d nrm;
+                                if (brep.ClosestPoint(tangentPos, out cp, out ci, out cs2, out ct2, double.MaxValue, out nrm))
                                     mapped[k] = cp;
                                 else
                                     mapped[k] = tangentPos;
