@@ -305,24 +305,51 @@ namespace Plugin01
                 }
                 else
                 {
-                    // 여러 바탕 곡면(예: 필렛 박스): 전개(unroll)해서 하나의 연속 패턴으로 깐다
-                    var draped = SurfaceDraper.Drape(_targetBrep, _faceIndices, _pattern, pBox, nU, nV);
-                    if (draped != null)
+                    // 여러 바탕 곡면(필렛 박스 등): 패턴을 영역 면적에 맞게 자동 스케일 후
+                    // BFS 위상 전달로 면 간 격자를 이어붙인다 (TileConnected).
+                    var info = PatternAnalyzer.Analyze(_pattern);
+                    if (!info.Valid)
                     {
-                        all.AddRange(draped);
+                        SetStatus("패턴 규칙 분석 실패");
+                        return null;
                     }
-                    else
+
+                    double regionArea = 0;
+                    var sub = _targetBrep.DuplicateSubBrep(_faceIndices);
+                    if (sub != null) regionArea = sub.GetArea();
+                    double patternArea = pw * ph;
+                    double scale = (regionArea > 1e-9 && patternArea > 1e-9)
+                        ? Math.Sqrt(regionArea / patternArea) : 1.0;
+
+                    info.PitchU *= scale;
+                    info.PitchV *= scale;
+                    info.CellW *= scale;
+                    info.CellH *= scale;
+                    var xf = Transform.Scale(Point3d.Origin, scale);
+                    for (int k = 0; k < info.UnitCells.Count; k++)
                     {
-                        // 전개 불가(이중곡면 다면 등): 면별로 폴백
-                        SetStatus("전개 불가 형상 — 면별 적용으로 폴백합니다.");
-                        foreach (var grp in groups.Values)
+                        var c = info.UnitCells[k].DuplicateCurve();
+                        c.Transform(xf);
+                        info.UnitCells[k] = c;
+                    }
+
+                    // seed 면의 du를 세계 좌표 기준으로 사용
+                    Vector3d refDir = Vector3d.Zero;
+                    var seedFace = _targetBrep.Faces[_faceIndices[0]];
+                    {
+                        var sd0 = seedFace.Domain(0); var sd1 = seedFace.Domain(1);
+                        Point3d sp; Vector3d[] sders;
+                        if (seedFace.Evaluate(sd0.ParameterAt(0.5), sd1.ParameterAt(0.5), 1, out sp, out sders) && sders != null && sders.Length >= 1)
                         {
-                            var srf = grp[0].UnderlyingSurface();
-                            Interval uReg, vReg;
-                            SurfaceTiler.CombinedUvRegion(grp, out uReg, out vReg);
-                            all.AddRange(SurfaceTiler.TileRegion(srf, grp, uReg, vReg, _pattern, pBox, nU, nV, chord));
+                            refDir = sders[0];
+                            refDir.Unitize();
                         }
                     }
+
+                    double angleTol = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
+                    all.AddRange(SurfaceTiler.TileConnected(_targetBrep, _faceIndices, info, refDir, angleTol));
+
+                    SetStatus($"한 장 늘려 맞춤(다면 연속): 스케일 x{scale:0.##}, 커브 {all.Count}개");
                 }
                 return all;
             }
