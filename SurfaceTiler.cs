@@ -73,7 +73,8 @@ namespace Plugin01
                                              Interval uReg, Interval vReg,
                                              IList<Curve> pattern, BoundingBox patternBox,
                                              int nU, int nV, double sampleChord,
-                                             double margin = 0)
+                                             double margin = 0, bool flipH = false, bool flipV = false,
+                                             double rotationDeg = 0)
         {
             var result = new List<Curve>();
             if (srf == null || pattern == null || pattern.Count == 0) return result;
@@ -104,9 +105,14 @@ namespace Plugin01
             var vd = srf.Domain(1);
             bool fullU = Math.Abs(uReg.Length - ud.Length) < 1e-4 * Math.Max(1.0, ud.Length);
             bool fullV = Math.Abs(vReg.Length - vd.Length) < 1e-4 * Math.Max(1.0, vd.Length);
-            double Wx = pw, Wy = ph;
-            if (srf.IsClosed(0) && fullU) Wx = pw + EstimateGap(pattern, 0);
-            if (srf.IsClosed(1) && fullV) Wy = ph + EstimateGap(pattern, 1);
+            // 회전된 패턴 bbox 크기 (회전 0이면 원래 pw, ph)
+            double absCr = Math.Abs(Math.Cos(rotationDeg * Math.PI / 180.0));
+            double absSr = Math.Abs(Math.Sin(rotationDeg * Math.PI / 180.0));
+            double Wrot = pw * absCr + ph * absSr;
+            double Hrot = pw * absSr + ph * absCr;
+            double Wx = Wrot, Wy = Hrot;
+            if (srf.IsClosed(0) && fullU) Wx = Wrot + EstimateGap(pattern, 0);
+            if (srf.IsClosed(1) && fullV) Wy = Hrot + EstimateGap(pattern, 1);
 
             // 호 길이 기준 매핑: 영역 안에서 표면 점을 직접 샘플링해 실제 거리 테이블 구성
             // (파라미터 불균일 때문에 평면/곡면 셀 크기가 달라지거나 경계서 뭉치는 문제 방지)
@@ -128,8 +134,21 @@ namespace Plugin01
                         var mapped = new Point3d[pts.Length];
                         for (int k = 0; k < pts.Length; k++)
                         {
-                            double fx = (pts[k].X - patternBox.Min.X) / Wx;
-                            double fy = (pts[k].Y - patternBox.Min.Y) / Wy;
+                            double xRel = pts[k].X - patternBox.Min.X;
+                            double yRel = pts[k].Y - patternBox.Min.Y;
+                            if (flipH) xRel = pw - xRel;
+                            if (flipV) yRel = ph - yRel;
+                            // 회전 후 새 bbox(Wrot × Hrot) 내 좌표로 변환
+                            if (Math.Abs(rotationDeg) > 1e-9)
+                            {
+                                double rr = rotationDeg * Math.PI / 180.0;
+                                double cosR = Math.Cos(rr), sinR = Math.Sin(rr);
+                                double dx = xRel - pw * 0.5, dy = yRel - ph * 0.5;
+                                xRel = dx * cosR - dy * sinR + Wrot * 0.5;
+                                yRel = dx * sinR + dy * cosR + Hrot * 0.5;
+                            }
+                            double fx = xRel / Wx;
+                            double fy = yRel / Wy;
                             double sU = (i + fx) / nU * totalU;
                             double sV = (j + fy) / nV * totalV;
                             double u = InterpParam(uCum, uPar, sU);
@@ -706,7 +725,8 @@ namespace Plugin01
         public static List<Curve> TileConnectedPartial(Brep brep, IList<int> faceIndices,
                                                        IList<Curve> patternCurves, BoundingBox patternBox,
                                                        Vector3d refDir, double angleTolRad,
-                                                       double uOffsetMm, double vOffsetMm, double rotationDeg)
+                                                       double uOffsetMm, double vOffsetMm, double rotationDeg,
+                                                       double scale = 1.0)
         {
             var result = new List<Curve>();
             if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
@@ -762,9 +782,9 @@ namespace Plugin01
                 bool ok = true;
                 for (int k = 0; k < pts.Length; k++)
                 {
-                    // 패턴 중심 기준 오프셋
-                    double dx = pts[k].X - pCx;
-                    double dy = pts[k].Y - pCy;
+                    // 패턴 중심 기준 오프셋 + 스케일
+                    double dx = (pts[k].X - pCx) * scale;
+                    double dy = (pts[k].Y - pCy) * scale;
                     // 회전
                     double rx = dx * cosR - dy * sinR;
                     double ry = dx * sinR + dy * cosR;
@@ -807,7 +827,9 @@ namespace Plugin01
         public static List<Curve> TileConnectedStretch(Brep brep, IList<int> faceIndices,
                                                        IList<Curve> patternCurves, BoundingBox patternBox,
                                                        Vector3d refDir, double angleTolRad,
-                                                       int nU = 1, int nV = 1, double margin = 0)
+                                                       int nU = 1, int nV = 1, double margin = 0,
+                                                       bool flipH = false, bool flipV = false,
+                                                       double rotationDeg = 0)
         {
             var result = new List<Curve>();
             if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
@@ -901,11 +923,17 @@ namespace Plugin01
             double iSpan = iMaxG - iMinG;
             double jSpan = jMaxG - jMinG;
 
+            // 회전된 패턴 bbox 크기 (회전 0이면 원래 pw, ph2)
+            double absC = Math.Abs(Math.Cos(rotationDeg * Math.PI / 180.0));
+            double absS = Math.Abs(Math.Sin(rotationDeg * Math.PI / 180.0));
+            double Wrot = pw * absC + ph2 * absS;
+            double Hrot = pw * absS + ph2 * absC;
+
             // 패턴 내부 인접 셀 사이 간격 (반복 사이 간격으로 사용)
             double gapX = nU > 1 ? EstimateGap(patternCurves, 0) : 0;
             double gapY = nV > 1 ? EstimateGap(patternCurves, 1) : 0;
-            double effSpanU = nU * pw + (nU - 1) * gapX;
-            double effSpanV = nV * ph2 + (nV - 1) * gapY;
+            double effSpanU = nU * Wrot + (nU - 1) * gapX;
+            double effSpanV = nV * Hrot + (nV - 1) * gapY;
 
             double chord = Math.Max(info.CellW, info.CellH) / 20.0;
 
@@ -920,8 +948,21 @@ namespace Plugin01
                         bool ok = true;
                         for (int k = 0; k < pts.Length; k++)
                         {
-                            double gx = ti * (pw + gapX) + (pts[k].X - patternBox.Min.X);
-                            double gy = tj * (ph2 + gapY) + (pts[k].Y - patternBox.Min.Y);
+                            double xRel = pts[k].X - patternBox.Min.X;
+                            double yRel = pts[k].Y - patternBox.Min.Y;
+                            if (flipH) xRel = pw - xRel;
+                            if (flipV) yRel = ph2 - yRel;
+                            // 회전 후 새 bbox(Wrot × Hrot) 내 좌표로 변환
+                            if (Math.Abs(rotationDeg) > 1e-9)
+                            {
+                                double rr = rotationDeg * Math.PI / 180.0;
+                                double cosR = Math.Cos(rr), sinR = Math.Sin(rr);
+                                double dx = xRel - pw * 0.5, dy = yRel - ph2 * 0.5;
+                                xRel = dx * cosR - dy * sinR + Wrot * 0.5;
+                                yRel = dx * sinR + dy * cosR + Hrot * 0.5;
+                            }
+                            double gx = ti * (Wrot + gapX) + xRel;
+                            double gy = tj * (Hrot + gapY) + yRel;
                             double vi = iMinG + gx / effSpanU * iSpan;
                             double vj = jMinG + gy / effSpanV * jSpan;
 

@@ -29,9 +29,14 @@ namespace Plugin01
         private readonly NumericStepper _uOff = new NumericStepper { Value = 0, DecimalPlaces = 2, Increment = 1.0, Width = 70 };
         private readonly NumericStepper _vOff = new NumericStepper { Value = 0, DecimalPlaces = 2, Increment = 1.0, Width = 70 };
         private readonly NumericStepper _rotDeg = new NumericStepper { Value = 0, DecimalPlaces = 1, Increment = 5.0, Width = 70 };
+        private readonly NumericStepper _scalePct = new NumericStepper { Value = 100, MinValue = 1, MaxValue = 1000, DecimalPlaces = 1, Increment = 10, Width = 70 };
         private readonly NumericStepper _rotDegR = new NumericStepper { Value = 0, DecimalPlaces = 1, Increment = 5.0, Width = 70 };
+        private readonly CheckBox _flipH = new CheckBox { Text = "좌우 반전" };
+        private readonly CheckBox _flipV = new CheckBox { Text = "상하 반전" };
+        private readonly NumericStepper _rotDegS = new NumericStepper { Value = 0, DecimalPlaces = 1, Increment = 5.0, Width = 70 };
         private StackLayout _rowPartial;
         private StackLayout _rowRealSize;
+        private StackLayout _rowFlips;
 
         private StackLayout _rowCounts;
 
@@ -74,12 +79,21 @@ namespace Plugin01
                 Visible = true
             };
 
+            _rowFlips = new StackLayout
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 10,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Items = { _flipH, _flipV, new Label { Text = "회전°:" }, _rotDegS },
+                Visible = true
+            };
+
             _rowPartial = new StackLayout
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 6,
                 VerticalContentAlignment = VerticalAlignment.Center,
-                Items = { new Label { Text = "U(mm):" }, _uOff, new Label { Text = "V(mm):" }, _vOff, new Label { Text = "회전°:" }, _rotDeg },
+                Items = { new Label { Text = "U(mm):" }, _uOff, new Label { Text = "V(mm):" }, _vOff, new Label { Text = "회전°:" }, _rotDeg, new Label { Text = "크기%:" }, _scalePct },
                 Visible = false
             };
 
@@ -133,6 +147,7 @@ namespace Plugin01
                     new Label { Text = "방식" },
                     _ddMode,
                     _rowCounts,
+                    _rowFlips,
                     _rowRealSize,
                     _rowPartial,
                     rowMargin,
@@ -158,6 +173,7 @@ namespace Plugin01
         {
             int m = _ddMode.SelectedIndex;
             _rowCounts.Visible = (m == 0);
+            _rowFlips.Visible = (m == 0);
             _rowRealSize.Visible = (m == 1);
             _rowPartial.Visible = (m == 2);
         }
@@ -421,9 +437,10 @@ namespace Plugin01
 
                 try
                 {
-                    all.AddRange(SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, _pattern, pBox, refDirP, angleTolP, _uOff.Value, _vOff.Value, _rotDeg.Value));
+                    double scale = Math.Max(0.0001, _scalePct.Value / 100.0);
+                    all.AddRange(SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, _pattern, pBox, refDirP, angleTolP, _uOff.Value, _vOff.Value, _rotDeg.Value, scale));
                     all = ApplyMarginFilter(all);
-                    SetStatus($"부분 적용: U={_uOff.Value:0.#} V={_vOff.Value:0.#} 회전={_rotDeg.Value:0.#}° → 셀 {all.Count}개");
+                    SetStatus($"부분 적용: U={_uOff.Value:0.#} V={_vOff.Value:0.#} 회전={_rotDeg.Value:0.#}° 크기={_scalePct.Value:0.#}% → 셀 {all.Count}개");
                     return all;
                 }
                 catch (Exception ex) { SetStatus("배치 실패: " + ex.Message); return null; }
@@ -466,7 +483,7 @@ namespace Plugin01
                     var srf = grp[0].UnderlyingSurface();
                     Interval uReg, vReg;
                     SurfaceTiler.CombinedUvRegion(grp, out uReg, out vReg);
-                    all.AddRange(SurfaceTiler.TileRegion(srf, grp, uReg, vReg, _pattern, pBox, nU, nV, chord, marginMm));
+                    all.AddRange(SurfaceTiler.TileRegion(srf, grp, uReg, vReg, _pattern, pBox, nU, nV, chord, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
                 }
                 else
                 {
@@ -484,7 +501,7 @@ namespace Plugin01
                     }
 
                     double angleTol = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
-                    all.AddRange(SurfaceTiler.TileConnectedStretch(_targetBrep, _faceIndices, _pattern, pBox, refDir, angleTol, nU, nV, marginMm));
+                    all.AddRange(SurfaceTiler.TileConnectedStretch(_targetBrep, _faceIndices, _pattern, pBox, refDir, angleTol, nU, nV, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
 
                     SetStatus($"한 장 늘려 맞춤(다면 연속, {nU}x{nV}): 패턴 {_pattern.Count}개 -> 커브 {all.Count}개");
                 }
