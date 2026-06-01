@@ -36,6 +36,7 @@ namespace Plugin01
 
         private readonly CheckBox _autoConnect = new CheckBox { Text = "연결면 자동 선택 (끄면 면 직접 다중 선택)", Checked = true };
         private readonly DropDown _ddMode = new DropDown();
+        private readonly DropDown _ddStrategy = new DropDown();
         private readonly NumericStepper _nu = new NumericStepper { Value = 1, MinValue = 1, MaxValue = 1000, DecimalPlaces = 0, Width = 60 };
         private readonly NumericStepper _nv = new NumericStepper { Value = 1, MinValue = 1, MaxValue = 1000, DecimalPlaces = 0, Width = 60 };
         private readonly NumericStepper _margin = new NumericStepper { Value = 0, MinValue = 0, DecimalPlaces = 2, Increment = 0.5, Width = 80 };
@@ -49,7 +50,17 @@ namespace Plugin01
         private readonly NumericStepper _rotDegS = new NumericStepper { Value = 0, DecimalPlaces = 1, Increment = 5.0, Width = 70 };
         private StackLayout _rowPartial;
         private StackLayout _rowRealSize;
+        private StackLayout _rowStrategy;
+        private StackLayout _rowBoundary;
+        private readonly DropDown _ddBoundary = new DropDown();
+        private readonly NumericStepper _fadeRings = new NumericStepper { Value = 2, MinValue = 1, MaxValue = 10, DecimalPlaces = 0, Width = 55 };
         private StackLayout _rowFlips;
+        private StackLayout _rowOpenRatio;
+        private readonly CheckBox _openRatioEnable = new CheckBox { Text = "개구율 맞춤" };
+        private readonly NumericStepper _openRatioPct = new NumericStepper { Value = 30, MinValue = 0.1, MaxValue = 90, DecimalPlaces = 1, Increment = 1.0, Width = 70 };
+        private readonly Label _lblOpenArea = new Label { Text = "  (면 선택 시 개구 면적 표시)" };
+        private double _selectedFaceArea = 0; // 선택 면 합산 면적(mm²), 면 선택 시 갱신
+        private double _lastPreviewArea = -1; // 마지막 미리보기 패턴 면적(mm²) — PartialFit 표시용
 
         private StackLayout _rowCounts;
 
@@ -89,6 +100,11 @@ namespace Plugin01
             _ddMode.SelectedIndex = 0;
             _ddMode.SelectedIndexChanged += OnModeChanged;
 
+            // RealSize 전용 알고리즘(전략) 선택 — 대상 표면에 따라 골라 타일링 성공률을 높임
+            _ddStrategy.Items.Add("전략 1: 표면 따라 걷기 (곡면/연속면)");
+            _ddStrategy.Items.Add("전략 2: 평면 격자 투영 (다면/평면 위주)");
+            _ddStrategy.SelectedIndex = 0;
+
             _rowCounts = new StackLayout
             {
                 Orientation = Orientation.Horizontal,
@@ -122,6 +138,41 @@ namespace Plugin01
                 Spacing = 6,
                 VerticalContentAlignment = VerticalAlignment.Center,
                 Items = { new Label { Text = "회전°:" }, _rotDegR },
+                Visible = false
+            };
+
+            // 개구율 맞춤: 목표 개구율(%)에 맞게 2D 패턴 구멍 크기를 조절(간격 유지)
+            _rowOpenRatio = new StackLayout
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Items = { _openRatioEnable, new Label { Text = "목표 개구율(%):" }, _openRatioPct }
+            };
+            // % 나 사용 여부가 바뀌면 개구 면적(mm²) 표시 갱신
+            _openRatioPct.ValueChanged += (s2, e2) => UpdateOpenAreaInfo();
+            _openRatioEnable.CheckedChanged += (s2, e2) => UpdateOpenAreaInfo();
+
+            // RealSize 전용 경계(초록선) 처리 방식
+            _ddBoundary.Items.Add("경계 셀 삭제");
+            _ddBoundary.Items.Add("경계로 갈수록 축소");
+            _ddBoundary.Items.Add("경계에 맞춰 자르기");
+            _ddBoundary.SelectedIndex = 0;
+            _rowBoundary = new StackLayout
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Items = { new Label { Text = "경계 처리:" }, _ddBoundary, new Label { Text = "축소 링:" }, _fadeRings },
+                Visible = false
+            };
+
+            _rowStrategy = new StackLayout
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Items = { new Label { Text = "알고리즘:" }, _ddStrategy },
                 Visible = false
             };
 
@@ -217,8 +268,12 @@ namespace Plugin01
                     _rowCounts,
                     _rowFlips,
                     _rowRealSize,
+                    _rowBoundary,
+                    _rowStrategy,
                     _rowPartial,
                     rowMargin,
+                    _rowOpenRatio,
+                    _lblOpenArea,
                     btnPreview,
                     btnClear,
                     btnInteractivePlace,
@@ -270,7 +325,12 @@ namespace Plugin01
             _rowCounts.Visible = (m == 0);
             _rowFlips.Visible = (m == 0);
             _rowRealSize.Visible = (m == 1);
+            _rowBoundary.Visible = (m == 1 || m == 2); // 경계 처리 옵션: RealSize / PartialFit
+            _rowStrategy.Visible = true; // 세 모드 모두 알고리즘(전략) 선택 제공
             _rowPartial.Visible = (m == 2);
+            _rowOpenRatio.Visible = (m == 1); // 개구율 % 는 RealSize 만. Stretch/PartialFit 은 실제 패턴 면적만 표시
+            _lastPreviewArea = -1;
+            UpdateOpenAreaInfo();
         }
 
         private void OnImport(object sender, EventArgs e)
@@ -376,6 +436,7 @@ namespace Plugin01
             }
             _preview.Enabled = true;
             RhinoDoc.ActiveDoc?.Views.Redraw();
+            RecomputeSelectedFaceArea(); // 선택 면적 갱신 → 개구 면적 표시 업데이트
         }
 
         private void UpdatePunchOutlinePreview()
@@ -502,23 +563,141 @@ namespace Plugin01
             return filtered;
         }
 
+        // 선택 면들의 합산 면적(mm², trim 반영)을 다시 계산하고 개구 면적 표시 갱신.
+        private void RecomputeSelectedFaceArea()
+        {
+            double a = 0;
+            if (_targetBrep != null && _faceIndices != null)
+            {
+                foreach (int fi in _faceIndices)
+                {
+                    if (fi < 0 || fi >= _targetBrep.Faces.Count) continue;
+                    try
+                    {
+                        var fb = _targetBrep.Faces[fi].DuplicateFace(false); // 단일 trim 면 → 정확한 면적
+                        var amp = AreaMassProperties.Compute(fb);
+                        if (amp != null) a += amp.Area;
+                    }
+                    catch { }
+                }
+            }
+            _selectedFaceArea = a;
+            UpdateOpenAreaInfo();
+        }
+
+        // 닫힌 커브들의 면적 합(mm²).
+        private static double TotalCurveArea(IList<Curve> curves)
+        {
+            double a = 0;
+            if (curves == null) return 0;
+            foreach (var c in curves)
+            {
+                if (c == null || !c.IsClosed) continue;
+                var amp = AreaMassProperties.Compute(c);
+                if (amp != null) a += Math.Abs(amp.Area);
+            }
+            return a;
+        }
+
+        // 개구 면적(mm²) 라벨 갱신. PartialFit 은 실제 생성 패턴 면적, 그 외는 목표 개구율 × 선택 면적.
+        private void UpdateOpenAreaInfo()
+        {
+            if (_ddMode.SelectedIndex != 1) // Stretch/PartialFit: 현재 미리보기 패턴의 실제 면적
+            {
+                _lblOpenArea.Text = _lastPreviewArea >= 0
+                    ? $"  현재 패턴 면적 {_lastPreviewArea:0.#} mm²"
+                    : "  (미리보기하면 패턴 면적 표시)";
+                return;
+            }
+            if (_selectedFaceArea <= 0)
+            {
+                _lblOpenArea.Text = "  (면 선택 시 개구 면적 표시)";
+                return;
+            }
+            double ratio = Math.Max(0.0, _openRatioPct.Value / 100.0);
+            double openArea = ratio * _selectedFaceArea;
+            string off = _openRatioEnable.Checked == true ? "" : "  ※개구율 맞춤 꺼짐";
+            _lblOpenArea.Text = $"  선택 면적 {_selectedFaceArea:0.#} mm² · 목표 개구 {openArea:0.#} mm²{off}";
+        }
+
+        // 개구율 맞춤: 목표 개구율(%)에 맞게 각 구멍을 "자기 중심" 기준으로 2D 스케일(간격 유지).
+        // 끄면 원본 그대로 반환. achievedPct = 적용된 목표 개구율(%) (미적용 시 -1).
+        // 개구율 = 구멍면적 / 셀면적(pitch 기반, 실패 시 패턴 bbox 기반).
+        private List<Curve> ApplyOpenRatio(IList<Curve> src, out double achievedPct)
+        {
+            achievedPct = -1;
+            var passthrough = new List<Curve>(src);
+            if (_openRatioEnable.Checked != true) return passthrough;
+
+            // 현재 개구율: pitch 기반(정확) → 실패 시 bbox 기반
+            double current = -1;
+            var info = PatternAnalyzer.Analyze(src);
+            if (info.Valid && info.UnitCells.Count > 0)
+            {
+                double cellArea = info.PitchU * info.PitchV;
+                double unitHole = 0;
+                foreach (var uc in info.UnitCells)
+                {
+                    var a = AreaMassProperties.Compute(uc);
+                    if (a != null) unitHole += Math.Abs(a.Area);
+                }
+                if (cellArea > 1e-9 && unitHole > 1e-12) current = unitHole / cellArea;
+            }
+            if (current < 0)
+            {
+                var bb = BoundingBox.Empty; double ha = 0;
+                foreach (var c in src)
+                {
+                    bb.Union(c.GetBoundingBox(true));
+                    var a = AreaMassProperties.Compute(c);
+                    if (a != null) ha += Math.Abs(a.Area);
+                }
+                double ba = (bb.Max.X - bb.Min.X) * (bb.Max.Y - bb.Min.Y);
+                if (ba > 1e-9 && ha > 1e-12) current = ha / ba;
+            }
+            if (current < 0) { SetStatus("개구율 계산 실패 (닫힌 커브 패턴인지 확인)"); return passthrough; }
+
+            double target = Math.Max(0.001, _openRatioPct.Value / 100.0);
+            double s = Math.Sqrt(target / current);
+            if (double.IsNaN(s) || s < 1e-6) return passthrough;
+
+            var scaled = new List<Curve>();
+            foreach (var c in src)
+            {
+                var d = c.DuplicateCurve();
+                var cb = d.GetBoundingBox(true);
+                d.Transform(Transform.Scale(cb.Center, s));
+                scaled.Add(d);
+            }
+            achievedPct = target * 100.0; // pitch 기반이면 정확히 목표에 수렴
+            return scaled;
+        }
+
         // 타일링 결과 커브 계산 (도큐먼트엔 추가하지 않음). 실패 시 null 반환.
         private List<Curve> ComputeTiling()
         {
             if (_targetBrep == null || _faceIndices.Count == 0) { SetStatus("먼저 대상 표면을 선택하세요."); return null; }
             if (_pattern == null || _pattern.Count == 0) { SetStatus("먼저 패턴을 불러오거나 선택하세요."); return null; }
 
+            int m = _ddMode.SelectedIndex;
+
+            // 개구율 맞춤: RealSize 만 적용. Stretch/PartialFit 은 실제 생성 패턴 면적만 표시(개구율 미적용).
+            double openAchieved = -1;
+            List<Curve> pattern;
+            if (m == 1) pattern = ApplyOpenRatio(_pattern, out openAchieved);
+            else pattern = new List<Curve>(_pattern);
+            string orInfo = openAchieved >= 0 ? $", 개구율~{openAchieved:0.#}%" : "";
+
             var pBox = BoundingBox.Empty;
-            foreach (var c in _pattern) pBox.Union(c.GetBoundingBox(true));
+            foreach (var c in pattern) pBox.Union(c.GetBoundingBox(true));
             if (!pBox.IsValid) { SetStatus("패턴 경계 계산 실패"); return null; }
 
-            int m = _ddMode.SelectedIndex;
             var all = new List<Curve>();
 
             // 실제 크기 - 패턴 분석 적용 (BFS 위상 전달로 면 간 연속성 유지)
             if (m == 1)
             {
-                var info = PatternAnalyzer.Analyze(_pattern);
+                var info = PatternAnalyzer.Analyze(pattern);
                 if (!info.Valid)
                 {
                     SetStatus("패턴 규칙 분석 실패 (간격을 못 찾음). 격자형 패턴인지 확인하세요.");
@@ -539,11 +718,22 @@ namespace Plugin01
                 }
                 double angleTolR = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
 
+                int strat = _ddStrategy.SelectedIndex;
+                double marginR = Math.Max(0, _margin.Value);
                 try
                 {
-                    all.AddRange(SurfaceTiler.TileConnectedRealSizeFit(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDegR.Value));
-                    all = ApplyMarginFilter(all);
-                    SetStatus($"분석: 셀 {info.CellW:0.#}x{info.CellH:0.#}, 회전 {_rotDegR.Value:0.#}° → 셀 {all.Count}개");
+                    if (strat == 1)
+                    {
+                        all.AddRange(SurfaceTiler.TileConnectedRealSizeFit_StrategyTwo(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDegR.Value));
+                        all = ApplyMarginFilter(all); // 전략2 는 종전대로 후처리 마진 필터
+                    }
+                    else
+                    {
+                        // 전략1: 경계 처리 모드 + margin(경계 인셋)을 타일러 내부에서 처리 → ApplyMarginFilter 미적용
+                        all.AddRange(SurfaceTiler.TileConnectedRealSizeFit(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDegR.Value, _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginR));
+                    }
+                    string stratName = (strat == 1) ? "전략2(평면격자)" : "전략1(표면걷기)";
+                    SetStatus($"분석[{stratName}]: 셀 {info.CellW:0.#}x{info.CellH:0.#}, 회전 {_rotDegR.Value:0.#}° → 셀 {all.Count}개{orInfo}");
                     return all;
                 }
                 catch (Exception ex) { SetStatus("배치 실패: " + ex.Message); return null; }
@@ -568,9 +758,17 @@ namespace Plugin01
                 try
                 {
                     double scale = Math.Max(0.0001, _scalePct.Value / 100.0);
-                    all.AddRange(SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, _pattern, pBox, refDirP, angleTolP, _uOff.Value, _vOff.Value, _rotDeg.Value, scale));
-                    all = ApplyMarginFilter(all);
-                    SetStatus($"부분 적용: U={_uOff.Value:0.#} V={_vOff.Value:0.#} 회전={_rotDeg.Value:0.#}° 크기={_scalePct.Value:0.#}% → 셀 {all.Count}개");
+                    double marginP = Math.Max(0, _margin.Value);
+                    if (_ddStrategy.SelectedIndex == 1) // 전략 2 → 접평면 스탬프 (표면 추종, 기존 방식)
+                    {
+                        all.AddRange(SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, pattern, pBox, refDirP, angleTolP, _uOff.Value, _vOff.Value, _rotDeg.Value, scale));
+                        all = ApplyMarginFilter(all); // 전략2 는 후처리 마진 필터
+                    }
+                    else                                 // 전략 1 → 평행 투영 (경계 처리 + 마진을 타일러 내부 처리)
+                        all.AddRange(SurfaceTiler.TileConnectedPartial_Projection(_targetBrep, _faceIndices, pattern, pBox, refDirP, angleTolP, _uOff.Value, _vOff.Value, _rotDeg.Value, scale, null, _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginP));
+                    _lastPreviewArea = TotalCurveArea(all); // 실제 생성 패턴 면적 → 라벨 표시
+                    UpdateOpenAreaInfo();
+                    SetStatus($"부분 적용[전략{_ddStrategy.SelectedIndex + 1}]: U={_uOff.Value:0.#} V={_vOff.Value:0.#} 회전={_rotDeg.Value:0.#}° 크기={_scalePct.Value:0.#}% → 셀 {all.Count}개, 면적 {_lastPreviewArea:0.#} mm²");
                     return all;
                 }
                 catch (Exception ex) { SetStatus("배치 실패: " + ex.Message); return null; }
@@ -583,7 +781,7 @@ namespace Plugin01
             int nU = Math.Max(1, (int)_nu.Value);
             int nV = Math.Max(1, (int)_nv.Value);
 
-            long est = (long)_pattern.Count * nU * nV * _faceIndices.Count;
+            long est = (long)pattern.Count * nU * nV * _faceIndices.Count;
             if (est > 30000)
             {
                 var r = MessageBox.Show(this, $"커브 약 {est}개가 생성됩니다. 계속할까요?",
@@ -595,7 +793,24 @@ namespace Plugin01
             double marginMm = Math.Max(0, _margin.Value);
             try
             {
-                // 같은 바탕 곡면을 공유하는 면들끼리 묶기
+                if (_ddStrategy.SelectedIndex != 1) // 전략 1 → 평행 투영 (모든 면 공통)
+                {
+                    Vector3d refDirS = Vector3d.Zero;
+                    var seedFaceS = _targetBrep.Faces[_faceIndices[0]];
+                    {
+                        var sd0 = seedFaceS.Domain(0); var sd1 = seedFaceS.Domain(1);
+                        Point3d sp; Vector3d[] sders;
+                        if (seedFaceS.Evaluate(sd0.ParameterAt(0.5), sd1.ParameterAt(0.5), 1, out sp, out sders) && sders != null && sders.Length >= 1)
+                        { refDirS = sders[0]; refDirS.Unitize(); }
+                    }
+                    double angleTolS = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
+                    all.AddRange(SurfaceTiler.TileConnectedStretch_Projection(_targetBrep, _faceIndices, pattern, pBox, refDirS, angleTolS, nU, nV, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
+                    _lastPreviewArea = TotalCurveArea(all); UpdateOpenAreaInfo();
+                    SetStatus($"한 장 늘려 맞춤[전략1(투영), {nU}x{nV}]: 패턴 {pattern.Count}개 → 커브 {all.Count}개, 면적 {_lastPreviewArea:0.#} mm²");
+                    return all;
+                }
+
+                // 전략 2: 기존 방식 — 같은 바탕 곡면을 공유하는 면들끼리 묶기
                 var groups = new Dictionary<int, List<BrepFace>>();
                 foreach (int fi in _faceIndices)
                 {
@@ -613,7 +828,7 @@ namespace Plugin01
                     var srf = grp[0].UnderlyingSurface();
                     Interval uReg, vReg;
                     SurfaceTiler.CombinedUvRegion(grp, out uReg, out vReg);
-                    all.AddRange(SurfaceTiler.TileRegion(srf, grp, uReg, vReg, _pattern, pBox, nU, nV, chord, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
+                    all.AddRange(SurfaceTiler.TileRegion(srf, grp, uReg, vReg, pattern, pBox, nU, nV, chord, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
                 }
                 else
                 {
@@ -631,10 +846,11 @@ namespace Plugin01
                     }
 
                     double angleTol = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
-                    all.AddRange(SurfaceTiler.TileConnectedStretch(_targetBrep, _faceIndices, _pattern, pBox, refDir, angleTol, nU, nV, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
+                    all.AddRange(SurfaceTiler.TileConnectedStretch(_targetBrep, _faceIndices, pattern, pBox, refDir, angleTol, nU, nV, marginMm, _flipH.Checked == true, _flipV.Checked == true, _rotDegS.Value));
 
-                    SetStatus($"한 장 늘려 맞춤(다면 연속, {nU}x{nV}): 패턴 {_pattern.Count}개 -> 커브 {all.Count}개");
+                    SetStatus($"한 장 늘려 맞춤(다면 연속, {nU}x{nV}): 패턴 {pattern.Count}개 -> 커브 {all.Count}개");
                 }
+                _lastPreviewArea = TotalCurveArea(all); UpdateOpenAreaInfo();
                 return all; // stretch는 마진이 영역 인셋으로 이미 적용됨
             }
             catch (Exception ex) { SetStatus("타일링 실패: " + ex.Message); return null; }
@@ -721,22 +937,35 @@ namespace Plugin01
             {
                 if (fi < 0 || fi >= _targetBrep.Faces.Count) continue;
                 var face = _targetBrep.Faces[fi];
-                var dom = face.Domain(0);
-                var dom2 = face.Domain(1);
-                double fuc = 0.5 * (dom.Min + dom.Max);
-                double fvc = 0.5 * (dom2.Min + dom2.Max);
-                Point3d c = ((Surface)face).PointAt(fuc, fvc);
-                Vector3d du, dv;
+                // trim 의 2D bbox 사용 (face.Domain 의 untrimmed surface 중심은 trim 밖이거나 singularity 가능)
+                double fuMin = face.Domain(0).T0, fuMax = face.Domain(0).T1;
+                double fvMin = face.Domain(1).T0, fvMax = face.Domain(1).T1;
+                try
+                {
+                    var c2 = face.OuterLoop?.To2dCurve();
+                    if (c2 != null)
+                    {
+                        var bb2 = c2.GetBoundingBox(true);
+                        fuMin = bb2.Min.X; fuMax = bb2.Max.X;
+                        fvMin = bb2.Min.Y; fvMax = bb2.Max.Y;
+                    }
+                }
+                catch { }
+                double fuc = 0.5 * (fuMin + fuMax);
+                double fvc = 0.5 * (fvMin + fvMax);
+
+                Vector3d[] derivs;
                 Point3d dummyPt;
-                ((Surface)face).Evaluate(fuc, fvc, 1, out dummyPt, out var derivs);
+                // Evaluate 반환값 체크
+                if (!((Surface)face).Evaluate(fuc, fvc, 1, out dummyPt, out derivs)) continue;
                 if (derivs == null || derivs.Length < 2) continue;
-                du = derivs[0]; dv = derivs[1];
+                Vector3d du = derivs[0]; Vector3d dv = derivs[1];
                 if (du.Length < 1e-9 || dv.Length < 1e-9) continue;
                 var n = Vector3d.CrossProduct(du, dv);
                 if (n.Length < 1e-9) continue;
                 n.Unitize();
                 avgN += n;
-                sumCenter += (Vector3d)c;
+                sumCenter += (Vector3d)dummyPt;
                 validCount++;
             }
             if (validCount == 0) return false;
@@ -839,8 +1068,9 @@ namespace Plugin01
             {
                 SetStatus("먼저 패턴을 불러오세요"); return;
             }
+            var patternL = new List<Curve>(_pattern); // 인터랙티브=PartialFit: 개구율 미적용(크기조절로 조정)
             BoundingBox pBoxL = BoundingBox.Empty;
-            foreach (var pc in _pattern) pBoxL.Union(pc.GetBoundingBox(true));
+            foreach (var pc in patternL) pBoxL.Union(pc.GetBoundingBox(true));
             Vector3d refDirL = Vector3d.Zero;
             {
                 var seedFaceL = _targetBrep.Faces[_faceIndices[0]];
@@ -859,9 +1089,20 @@ namespace Plugin01
                 try
                 {
                     double scaleL = Math.Max(0.0001, _scalePct.Value / 100.0);
-                    var res = SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, _pattern, pBoxL,
-                        refDirL, angleTolL, _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter);
-                    res = ApplyMarginFilter(res ?? new List<Curve>());
+                    double marginL = Math.Max(0, _margin.Value);
+                    List<Curve> res;
+                    if (_ddStrategy.SelectedIndex == 1) // 전략 2 → 접평면 스탬프
+                    {
+                        res = SurfaceTiler.TileConnectedPartial(_targetBrep, _faceIndices, patternL, pBoxL,
+                            refDirL, angleTolL, _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter);
+                        res = ApplyMarginFilter(res ?? new List<Curve>());
+                    }
+                    else                                 // 전략 1 → 평행 투영 (경계 처리 + 마진 내부 처리)
+                        res = SurfaceTiler.TileConnectedPartial_Projection(_targetBrep, _faceIndices, patternL, pBoxL,
+                            refDirL, angleTolL, _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter,
+                            _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginL) ?? new List<Curve>();
+                    _lastPreviewArea = TotalCurveArea(res); // 인터랙티브 배치 중 실제 패턴 면적 표시
+                    UpdateOpenAreaInfo();
                     return res;
                 }
                 catch { return new List<Curve>(); }

@@ -790,6 +790,909 @@ namespace Plugin01
         }
 
         /// <summary>
+        /// "실제 크기" 메인 (평행 투영 방식 — 균일 격자 유지):
+        ///   - 패턴을 punch 방향(avgN, World 축 snap)에 수직인 평면에 "강체" 균일 격자로 정의.
+        ///   - 각 셀의 모든 vertex 를 avgN 방향으로 표면에 평행 투영 → 위에서 본 간격·각도가 완벽 균일.
+        ///   - 격자점 1개 → 표면 1점(1:1) → 셀 중복 없음.
+        ///   - vertex 가 표면(선택 면 trim) 밖으로 투영되면 ray miss → 그 셀 제거 (외곽선/구멍 자동 클리핑).
+        ///   - 투영은 UV 를 안 쓰므로 미러 면도 중심선 양쪽 동일.
+        /// </summary>
+        // boundaryMode: 0=경계 셀 삭제, 1=경계로 갈수록 축소(페이드), 2=경계에 맞춰 자르기. fadeRings=축소 링 수.
+        // margin>0 이면 경계를 그만큼 안쪽으로 인셋한 "가상 경계"를 기준으로 삭제/축소/자르기 적용.
+        public static List<Curve> TileConnectedRealSizeFit(Brep brep, IList<int> faceIndices,
+                                                            PatternInfo info, Vector3d refDir, double angleTolRad,
+                                                            double rotationDeg = 0,
+                                                            int boundaryMode = 0, int fadeRings = 2, double margin = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (info == null || !info.Valid || info.UnitCells.Count == 0) return result;
+            var faceSet = new HashSet<int>(faceIndices);
+
+            // === 투영 방향(avgN) + 평면 격자 방향(Ti/Tj) ===
+            Vector3d avgN = Vector3d.Zero;
+            Vector3d sumCenter = Vector3d.Zero;
+            int validCount = 0;
+            foreach (int fi in faceIndices)
+            {
+                var face = brep.Faces[fi];
+                double fuMin, fuMax, fvMin, fvMax;
+                GetFaceUvBox(face, out fuMin, out fuMax, out fvMin, out fvMax);
+                double fuc = 0.5 * (fuMin + fuMax);
+                double fvc = 0.5 * (fvMin + fvMax);
+                Point3d c; Vector3d du, dv;
+                if (!EvalDeriv(face, fuc, fvc, out c, out du, out dv)) continue;
+                if (du.Length < 1e-9 || dv.Length < 1e-9) continue;
+                var n = Vector3d.CrossProduct(du, dv);
+                if (n.Length < 1e-9) continue;
+                n.Unitize();
+                if (face.OrientationIsReversed) n = -n; // 미러면 normal 복원
+                avgN += n;
+                sumCenter += (Vector3d)c;
+                validCount++;
+            }
+            if (validCount == 0) return result;
+            Point3d centroidPt = new Point3d(sumCenter / validCount);
+            if (avgN.Length < 1e-6) return result;
+            avgN.Unitize();
+
+            // avgN 을 가까운 World 축으로 snap (tilt 제거 → 축 정렬 패널은 완전 수직 투영)
+            double absX = Math.Abs(avgN.X), absY = Math.Abs(avgN.Y), absZ = Math.Abs(avgN.Z);
+            if (absZ > 0.9 && absZ >= absX && absZ >= absY) avgN = new Vector3d(0, 0, avgN.Z > 0 ? 1 : -1);
+            else if (absY > 0.9 && absY >= absX && absY >= absZ) avgN = new Vector3d(0, avgN.Y > 0 ? 1 : -1, 0);
+            else if (absX > 0.9 && absX >= absY && absX >= absZ) avgN = new Vector3d(avgN.X > 0 ? 1 : -1, 0, 0);
+
+            // 평면 내 격자 방향 Ti (refDir → World 축 fallback), Tj = avgN × Ti
+            Vector3d Ti_init = Vector3d.Zero;
+            if (refDir.Length > 1e-9)
+            {
+                var refOnPlane = refDir - (refDir * avgN) * avgN;
+                if (refOnPlane.Length > 1e-6) { refOnPlane.Unitize(); Ti_init = refOnPlane; }
+            }
+            if (Ti_init.Length < 1e-6)
+            {
+                Vector3d[] axes = { Vector3d.YAxis, Vector3d.XAxis, Vector3d.ZAxis };
+                foreach (var axis in axes)
+                {
+                    var proj = axis - (axis * avgN) * avgN;
+                    if (proj.Length > 1e-6) { proj.Unitize(); Ti_init = proj; break; }
+                }
+            }
+            if (Ti_init.Length < 1e-6) return result;
+
+            // 기본 0/90° 원칙: Ti 를 평면 내에서 가장 가까운 World 축(의 평면 투영)에 정렬.
+            // (refDir = 면 du 의 미세한 tilt 제거 → 회전 슬라이더 0 일 때 정확히 수직/수평)
+            {
+                Vector3d bestAxis = Vector3d.Zero;
+                double bestDot = -1;
+                foreach (var axis in new[] { Vector3d.XAxis, Vector3d.YAxis, Vector3d.ZAxis })
+                {
+                    var proj = axis - (axis * avgN) * avgN; // 평면에 투영 (avgN 과 평행한 축은 0 이 됨)
+                    if (proj.Length < 1e-6) continue;
+                    proj.Unitize();
+                    double dot = proj * Ti_init;
+                    if (Math.Abs(dot) > bestDot)
+                    {
+                        bestDot = Math.Abs(dot);
+                        bestAxis = (dot >= 0) ? proj : -proj; // 원래 Ti 방향(부호) 유지
+                    }
+                }
+                if (bestAxis.Length > 1e-6) Ti_init = bestAxis;
+            }
+
+            var Tj_init = Vector3d.CrossProduct(avgN, Ti_init);
+            Tj_init.Unitize();
+
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+            var Ti_world = cosR * Ti_init + sinR * Tj_init;
+            var Tj_world = -sinR * Ti_init + cosR * Tj_init;
+
+            // === 격자 anchor: centroid 를 표면에 snap → 그 점을 지나는 평면에 격자 정의 ===
+            Point3d seedSurf; int seedFi;
+            BoundingBox sbb = BoundingBox.Empty;
+            foreach (int fi in faceIndices) sbb.Union(brep.Faces[fi].GetBoundingBox(true));
+            double bboxDiag = sbb.Diagonal.Length;
+            if (!TrySnapToSelectedFacesWithIndex(brep, faceSet, centroidPt, bboxDiag, out seedSurf, out seedFi))
+                seedSurf = centroidPt;
+            Point3d planeOrigin = seedSurf; // avgN 성분은 투영으로 소거되므로 평면 위 임의 점이면 충분
+
+            // === 선택 면 mesh (평행 투영 + 외곽선/구멍 클리핑용) ===
+            var projMesh = new Mesh();
+            Mesh[] faceMeshes = Mesh.CreateFromBrep(brep, MeshingParameters.Default);
+            if (faceMeshes != null)
+            {
+                foreach (int fi in faceSet)
+                    if (fi < faceMeshes.Length && faceMeshes[fi] != null) projMesh.Append(faceMeshes[fi]);
+            }
+            if (projMesh.Faces.Count == 0) return result;
+            projMesh.Compact();
+            double rayLen = Math.Max(bboxDiag * 2.0, 1.0);
+
+            // === 패턴 단위셀 (평면에 강체로 stamp) ===
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+            var cellPts = new List<Point3d[]>();
+            foreach (var c in info.UnitCells) cellPts.Add(SampleCurve(c, chord));
+            var unitBBox = BoundingBox.Empty;
+            foreach (var c in info.UnitCells) unitBBox.Union(c.GetBoundingBox(true));
+            double ucX = unitBBox.Center.X, ucY = unitBBox.Center.Y;
+
+            // === 격자 index 범위: 선택 면 bbox 를 평면(Ti,Tj)에 투영 ===
+            double iMin = double.MaxValue, iMax = double.MinValue;
+            double jMin = double.MaxValue, jMax = double.MinValue;
+            foreach (var corner in sbb.GetCorners())
+            {
+                Vector3d vc = corner - planeOrigin;
+                double iv = (vc * Ti_world) / info.PitchU;
+                double jv = (vc * Tj_world) / info.PitchV;
+                if (iv < iMin) iMin = iv;
+                if (iv > iMax) iMax = iv;
+                if (jv < jMin) jMin = jv;
+                if (jv > jMax) jMax = jv;
+            }
+            int iStart = (int)Math.Floor(iMin) - 1, iEnd = (int)Math.Ceiling(iMax) + 1;
+            int jStart = (int)Math.Floor(jMin) - 1, jEnd = (int)Math.Ceiling(jMax) + 1;
+
+            // 경계 loop(2D) — 마진 인셋 또는 클립에 사용. 샘플은 셀 크기의 절반 정도(직선은 정확, 곡선은 충분히 매끄럽고 불리언 빠름).
+            double bSample = Math.Max(0.1, Math.Max(info.CellW, info.CellH) * 0.5);
+            List<Curve> bLoops = (margin > 1e-9 || boundaryMode == 2)
+                ? BuildPlaneBoundaryLoops(brep, faceIndices, planeOrigin, Ti_world, Tj_world, bSample) : null;
+            double clipTol = Math.Max(1e-4, Math.Min(info.CellW, info.CellH) * 0.01);
+            long Key(int i, int j) => ((long)(i + 100000) << 21) | (long)(j + 100000);
+
+            // === 모드 2(자르기): 빠른 mesh-ray 분류(ring) + 경계 띠만 불리언 클립 ===
+            if (boundaryMode == 2)
+            {
+                var clipLoops = (margin > 1e-9 && bLoops != null && bLoops.Count > 0)
+                    ? InsetLoops(bLoops, margin, clipTol) : bLoops;
+                double unitW = unitBBox.Max.X - unitBBox.Min.X, unitH = unitBBox.Max.Y - unitBBox.Min.Y;
+                double cellRad = 0.6 * Math.Sqrt(unitW * unitW + unitH * unitH);
+                double pitchMin = Math.Max(1e-9, Math.Min(info.PitchU, info.PitchV));
+                int bandRings = (int)Math.Ceiling((cellRad + Math.Max(0.0, margin)) / pitchMin) + 1;
+
+                // inside(중심 적중) 집합 — ray 1회/셀 (빠른 분류)
+                var insideC = new HashSet<long>();
+                for (int ki = iStart; ki <= iEnd; ki++)
+                    for (int kj = jStart; kj <= jEnd; kj++)
+                    {
+                        Point3d cc = planeOrigin + ki * info.PitchU * Ti_world + kj * info.PitchV * Tj_world;
+                        Point3d hitc;
+                        if (ProjectOntoMesh(projMesh, cc, avgN, rayLen, out hitc)) insideC.Add(Key(ki, kj));
+                    }
+
+                // 외곽으로부터 ring 인덱스 BFS (ring 1 = 비-inside 와 인접)
+                var cring = new Dictionary<long, int>();
+                var cq = new Queue<long>();
+                foreach (var key in insideC)
+                {
+                    int ki = (int)((key >> 21) - 100000);
+                    int kj = (int)((key & 0x1FFFFF) - 100000);
+                    if (!insideC.Contains(Key(ki + 1, kj)) || !insideC.Contains(Key(ki - 1, kj)) ||
+                        !insideC.Contains(Key(ki, kj + 1)) || !insideC.Contains(Key(ki, kj - 1)))
+                    { cring[key] = 1; cq.Enqueue(key); }
+                }
+                int[] cddi = { 1, -1, 0, 0 }, cddj = { 0, 0, 1, -1 };
+                while (cq.Count > 0)
+                {
+                    long key = cq.Dequeue();
+                    int ki = (int)((key >> 21) - 100000);
+                    int kj = (int)((key & 0x1FFFFF) - 100000);
+                    int r = cring[key];
+                    for (int dd = 0; dd < 4; dd++)
+                    {
+                        long nk = Key(ki + cddi[dd], kj + cddj[dd]);
+                        if (insideC.Contains(nk) && !cring.ContainsKey(nk)) { cring[nk] = r + 1; cq.Enqueue(nk); }
+                    }
+                }
+
+                // inside 셀: 깊은 내부(ring>band)=그대로, 띠(ring<=band)=클립
+                foreach (var key in insideC)
+                {
+                    int ki = (int)((key >> 21) - 100000);
+                    int kj = (int)((key & 0x1FFFFF) - 100000);
+                    Point3d cc = planeOrigin + ki * info.PitchU * Ti_world + kj * info.PitchV * Tj_world;
+                    bool deep = (cring.ContainsKey(key) ? cring[key] : bandRings + 1) > bandRings;
+                    foreach (var pts in cellPts)
+                    {
+                        if (deep)
+                        {
+                            var mapped = new Point3d[pts.Length];
+                            bool ok = true;
+                            for (int k = 0; k < pts.Length; k++)
+                            {
+                                double dx = pts[k].X - ucX, dy = pts[k].Y - ucY;
+                                double dxR = dx * cosR - dy * sinR, dyR = dx * sinR + dy * cosR;
+                                Point3d fp = cc + dxR * Ti_world + dyR * Tj_world;
+                                Point3d hit;
+                                if (!ProjectOntoMesh(projMesh, fp, avgN, rayLen, out hit)) { ok = false; break; }
+                                mapped[k] = hit;
+                            }
+                            if (ok) { var crv = new PolylineCurve(mapped); if (crv.IsValid) result.Add(crv); }
+                            else AddClippedCellCurves(result, pts, cc, ucX, ucY, cosR, sinR, Ti_world, Tj_world, avgN, planeOrigin, rayLen, projMesh, clipLoops, chord, clipTol);
+                        }
+                        else
+                            AddClippedCellCurves(result, pts, cc, ucX, ucY, cosR, sinR, Ti_world, Tj_world, avgN, planeOrigin, rayLen, projMesh, clipLoops, chord, clipTol);
+                    }
+                }
+
+                // 경계 바깥쪽으로 걸친 셀(중심은 밖이지만 inside 와 인접) → 클립해서 경계까지 채움
+                for (int ki = iStart; ki <= iEnd; ki++)
+                    for (int kj = jStart; kj <= jEnd; kj++)
+                    {
+                        long key = Key(ki, kj);
+                        if (insideC.Contains(key)) continue;
+                        if (!(insideC.Contains(Key(ki + 1, kj)) || insideC.Contains(Key(ki - 1, kj)) ||
+                              insideC.Contains(Key(ki, kj + 1)) || insideC.Contains(Key(ki, kj - 1)))) continue;
+                        Point3d cc = planeOrigin + ki * info.PitchU * Ti_world + kj * info.PitchV * Tj_world;
+                        foreach (var pts in cellPts)
+                            AddClippedCellCurves(result, pts, cc, ucX, ucY, cosR, sinR, Ti_world, Tj_world, avgN, planeOrigin, rayLen, projMesh, clipLoops, chord, clipTol);
+                    }
+                return result;
+            }
+
+            // === 모드 0(삭제)/1(축소): inside 격자점 (마진 인셋 반영) ===
+            var inside = new Dictionary<long, Point3d>();
+            for (int ki = iStart; ki <= iEnd; ki++)
+                for (int kj = jStart; kj <= jEnd; kj++)
+                {
+                    Point3d cc = planeOrigin + ki * info.PitchU * Ti_world + kj * info.PitchV * Tj_world;
+                    Point3d hitc;
+                    if (!ProjectOntoMesh(projMesh, cc, avgN, rayLen, out hitc)) continue;
+                    if (margin > 1e-9 && bLoops != null &&
+                        MinDistToLoops(To2D(cc, planeOrigin, Ti_world, Tj_world), bLoops) < margin) continue; // 마진 인셋
+                    inside[Key(ki, kj)] = cc;
+                }
+
+            // 모드 1(축소): 외곽으로부터 링 인덱스 BFS (ring 1 = 경계 접한 셀)
+            Dictionary<long, int> ring = null;
+            if (boundaryMode == 1)
+            {
+                ring = new Dictionary<long, int>();
+                var q = new Queue<long>();
+                foreach (var kv in inside)
+                {
+                    long key = kv.Key;
+                    int ki = (int)((key >> 21) - 100000);
+                    int kj = (int)((key & 0x1FFFFF) - 100000);
+                    if (!inside.ContainsKey(Key(ki + 1, kj)) || !inside.ContainsKey(Key(ki - 1, kj)) ||
+                        !inside.ContainsKey(Key(ki, kj + 1)) || !inside.ContainsKey(Key(ki, kj - 1)))
+                    { ring[key] = 1; q.Enqueue(key); }
+                }
+                int[] ddi = { 1, -1, 0, 0 }, ddj = { 0, 0, 1, -1 };
+                while (q.Count > 0)
+                {
+                    long key = q.Dequeue();
+                    int ki = (int)((key >> 21) - 100000);
+                    int kj = (int)((key & 0x1FFFFF) - 100000);
+                    int r = ring[key];
+                    for (int d = 0; d < 4; d++)
+                    {
+                        long nk = Key(ki + ddi[d], kj + ddj[d]);
+                        if (inside.ContainsKey(nk) && !ring.ContainsKey(nk)) { ring[nk] = r + 1; q.Enqueue(nk); }
+                    }
+                }
+            }
+
+            int fadeDenom = Math.Max(1, fadeRings) + 1;
+            foreach (var kv in inside)
+            {
+                Point3d cellCenterPlane = kv.Value;
+                double cellScale = 1.0;
+                if (boundaryMode == 1)
+                {
+                    int r = ring.ContainsKey(kv.Key) ? ring[kv.Key] : fadeDenom;
+                    cellScale = Math.Min(1.0, r / (double)fadeDenom);
+                    if (cellScale < 0.06) continue; // 거의 사라짐 → 생략
+                }
+                foreach (var pts in cellPts)
+                {
+                    var mapped = new Point3d[pts.Length];
+                    bool allOnSurface = true;
+                    for (int k = 0; k < pts.Length; k++)
+                    {
+                        double dx = (pts[k].X - ucX) * cellScale;
+                        double dy = (pts[k].Y - ucY) * cellScale;
+                        double dxR = dx * cosR - dy * sinR;
+                        double dyR = dx * sinR + dy * cosR;
+                        Point3d flatPlanePt = cellCenterPlane + dxR * Ti_world + dyR * Tj_world;
+                        Point3d hit;
+                        if (!ProjectOntoMesh(projMesh, flatPlanePt, avgN, rayLen, out hit)) { allOnSurface = false; break; }
+                        mapped[k] = hit;
+                    }
+                    if (allOnSurface) { var crv = new PolylineCurve(mapped); if (crv.IsValid) result.Add(crv); }
+                }
+            }
+            return result;
+        }
+
+        private static Point3d To2D(Point3d P, Point3d origin, Vector3d Ti, Vector3d Tj)
+        {
+            Vector3d v = P - origin;
+            return new Point3d(v * Ti, v * Tj, 0);
+        }
+
+        /// <summary>선택 면의 경계(외곽+구멍) naked edge 를 평면 2D(z=0) 닫힌 loop 으로 투영. sampleChord 로 촘촘히 샘플.</summary>
+        private static List<Curve> BuildPlaneBoundaryLoops(Brep brep, IList<int> faceIndices,
+                Point3d origin, Vector3d Ti, Vector3d Tj, double sampleChord)
+        {
+            var loops = new List<Curve>();
+            Brep sub = null;
+            try { sub = brep.DuplicateSubBrep(faceIndices); } catch { }
+            if (sub == null) return loops;
+            double sc = Math.Max(1e-4, sampleChord);
+            var segs = new List<Curve>();
+            foreach (var edge in sub.Edges)
+            {
+                var adj = edge.AdjacentFaces();
+                if (adj == null || adj.Length != 1) continue; // naked edge 만
+                var c = edge.DuplicateCurve();
+                if (c == null) continue;
+                // 균일 샘플 후 공선점 제거 → 직선은 양 끝점만, 곡선은 필요한 만큼 (정확 + 불리언 빠름).
+                int n = (int)Math.Ceiling(c.GetLength() / sc);
+                if (n < 8) n = 8; if (n > 2000) n = 2000;
+                var dom = c.Domain;
+                var full = new List<Point3d>(n + 1);
+                for (int i = 0; i <= n; i++) full.Add(To2D(c.PointAt(dom.ParameterAt(i / (double)n)), origin, Ti, Tj));
+                double simpTol = sc * 0.1;
+                var p2 = new List<Point3d> { full[0] };
+                for (int i = 1; i < full.Count - 1; i++)
+                {
+                    Point3d a = p2[p2.Count - 1], b = full[i], cc2 = full[i + 1];
+                    Vector3d ac = cc2 - a; double acl = ac.Length;
+                    double dist;
+                    if (acl < 1e-9) dist = b.DistanceTo(a);
+                    else { var cross = Vector3d.CrossProduct(ac, b - a); dist = cross.Length / acl; }
+                    if (dist > simpTol) p2.Add(b); // 공선이 아니면 유지
+                }
+                p2.Add(full[full.Count - 1]);
+                var pl = new PolylineCurve(p2);
+                if (pl.IsValid) segs.Add(pl);
+            }
+            var joined = Curve.JoinCurves(segs, Math.Max(0.01, sc));
+            if (joined != null)
+                foreach (var j in joined) if (j != null && j.IsClosed) loops.Add(j);
+            return loops;
+        }
+
+        /// <summary>경계에 걸친 셀(2D)을 경계 region(outer ∩ ¬holes)으로 클립 후 표면에 투영해 추가.</summary>
+        private static void AddClippedCellCurves(List<Curve> result, Point3d[] pts,
+                Point3d cellCenterPlane, double ucX, double ucY, double cosR, double sinR,
+                Vector3d Ti, Vector3d Tj, Vector3d avgN, Point3d origin, double rayLen,
+                Mesh projMesh, List<Curve> loops, double chord, double tol)
+        {
+            if (loops == null || loops.Count == 0) return;
+            double cu = (cellCenterPlane - origin) * Ti;
+            double cv = (cellCenterPlane - origin) * Tj;
+            var poly = new List<Point3d>();
+            foreach (var p in pts)
+            {
+                double dx = p.X - ucX, dy = p.Y - ucY;
+                double dxR = dx * cosR - dy * sinR;
+                double dyR = dx * sinR + dy * cosR;
+                poly.Add(new Point3d(cu + dxR, cv + dyR, 0));
+            }
+            ClipPolyAndProject(result, poly, cellCenterPlane, Ti, Tj, avgN, origin, rayLen, projMesh, loops, chord, tol);
+        }
+
+        /// <summary>평면 2D 폴리곤(poly, z=0)을 경계 region(outer ∩ ¬holes)으로 클립 후 표면에 투영해 추가.</summary>
+        private static void ClipPolyAndProject(List<Curve> result, List<Point3d> poly, Point3d center3D,
+                Vector3d Ti, Vector3d Tj, Vector3d avgN, Point3d origin, double rayLen,
+                Mesh projMesh, List<Curve> loops, double chord, double tol)
+        {
+            if (loops == null || loops.Count == 0 || poly == null || poly.Count < 3) return;
+            if (poly[0].DistanceTo(poly[poly.Count - 1]) > 1e-9) poly.Add(poly[0]);
+            var cell2D = new PolylineCurve(poly);
+            if (!cell2D.IsClosed) return;
+
+            // outer = 최대 면적 loop, 나머지 = 구멍
+            Curve outer = null; double bestA = -1;
+            var holes = new List<Curve>();
+            foreach (var lp in loops)
+            {
+                double a = LoopArea(lp);
+                if (a > bestA) { if (outer != null) holes.Add(outer); bestA = a; outer = lp; }
+                else holes.Add(lp);
+            }
+            if (outer == null) return;
+
+            var pieces = new List<Curve>();
+            Curve[] inter = null;
+            try { inter = Curve.CreateBooleanIntersection(cell2D, outer, tol); } catch { }
+            if (inter != null && inter.Length > 0) pieces.AddRange(inter);
+            else
+            {
+                // 불리언 결과 없음: 모든 꼭짓점이 outer 안일 때만(완전 내부) 원본 추가.
+                // 교차 셀인데 불리언 실패한 경우 통째로 추가하면 경계 밖 조각(리저/외부 셀)이 생기므로 버림.
+                bool allIn = true;
+                foreach (var pt in poly)
+                    if (outer.Contains(pt, Plane.WorldXY, tol) != PointContainment.Inside) { allIn = false; break; }
+                if (allIn) pieces.Add(cell2D);
+                else return;
+            }
+
+            // 구멍 빼기: 겹치면 차집합, 차집합 실패/빈 결과면 그 조각은 버림(구멍 안 잔여물 방지).
+            foreach (var hole in holes)
+            {
+                if (pieces.Count == 0) break;
+                var hbb = hole.GetBoundingBox(true);
+                var next = new List<Curve>();
+                foreach (var pc in pieces)
+                {
+                    var pbb = pc.GetBoundingBox(true);
+                    bool overlap = pbb.Min.X <= hbb.Max.X && pbb.Max.X >= hbb.Min.X &&
+                                   pbb.Min.Y <= hbb.Max.Y && pbb.Max.Y >= hbb.Min.Y;
+                    if (!overlap) { next.Add(pc); continue; } // 구멍과 안 겹침 → 그대로
+                    Curve[] diff = null;
+                    try { diff = Curve.CreateBooleanDifference(pc, hole, tol); } catch { }
+                    if (diff != null && diff.Length > 0) next.AddRange(diff);
+                    // diff 실패/빈 결과: 구멍과 겹치는데 못 빼면 버림 (구멍 안 침범 방지)
+                }
+                pieces = next;
+            }
+
+            foreach (var pc in pieces)
+            {
+                if (pc == null) continue;
+                // 클립 결과의 "실제 꼭짓점" 사용(코너 선명). 폴리라인이면 정점, 폴리커브(직선)면 세그먼트 시작점, 아니면 샘플.
+                Point3d[] sp = ClipPieceVertices(pc, chord);
+                if (sp == null || sp.Length < 3) continue;
+                int n = sp.Length;
+                var P3 = new Point3d[n];
+                var t = new double[n];
+                var hasT = new bool[n];
+                int hitCount = 0;
+                for (int k = 0; k < n; k++)
+                {
+                    P3[k] = origin + sp[k].X * Ti + sp[k].Y * Tj;
+                    Point3d hit;
+                    if (ProjectOntoMesh(projMesh, P3[k], avgN, rayLen, out hit))
+                    { t[k] = (hit - P3[k]) * avgN; hasT[k] = true; hitCount++; }
+                }
+                if (hitCount == 0) continue; // 표면에 전혀 안 닿음 → 버림(리저 방지)
+                // miss(컷 모서리) 점 높이: 고리(cyclic)를 따라 양쪽 적중점 사이 선형 보간 → 컷 모서리가 깔끔한 직선
+                var mapped = new Point3d[n + 1];
+                for (int k = 0; k < n; k++)
+                {
+                    double tk;
+                    if (hasT[k]) tk = t[k];
+                    else
+                    {
+                        int fwd = -1, bwd = -1, fdist = 0, bdist = 0;
+                        for (int s = 1; s <= n; s++) { int idx = (k + s) % n; if (hasT[idx]) { fwd = idx; fdist = s; break; } }
+                        for (int s = 1; s <= n; s++) { int idx = ((k - s) % n + n) % n; if (hasT[idx]) { bwd = idx; bdist = s; break; } }
+                        if (fwd < 0 && bwd < 0) tk = 0;
+                        else if (fwd < 0) tk = t[bwd];
+                        else if (bwd < 0) tk = t[fwd];
+                        else { double w = (double)bdist / (bdist + fdist); tk = t[bwd] + (t[fwd] - t[bwd]) * w; }
+                    }
+                    mapped[k] = P3[k] + tk * avgN; // (u,v) 정확 보존
+                }
+                mapped[n] = mapped[0]; // 닫기
+                var crv = new PolylineCurve(mapped);
+                if (crv.IsValid) result.Add(crv);
+            }
+        }
+
+        /// <summary>클립 결과 곡선의 꼭짓점 배열(닫힘 중복 제거). 폴리라인/직선 폴리커브는 정점 그대로(코너 선명), 그 외는 샘플.</summary>
+        private static Point3d[] ClipPieceVertices(Curve pc, double chord)
+        {
+            Polyline pl;
+            if (pc.TryGetPolyline(out pl) && pl != null && pl.Count >= 3)
+            {
+                int cnt = pl.Count;
+                if (cnt > 1 && pl[0].DistanceTo(pl[cnt - 1]) < 1e-9) cnt--; // 닫힘 중복 제거
+                var arr = new Point3d[cnt];
+                for (int i = 0; i < cnt; i++) arr[i] = pl[i];
+                return arr;
+            }
+            var segs = pc.DuplicateSegments();
+            if (segs != null && segs.Length >= 3)
+            {
+                bool allLine = true;
+                foreach (var s in segs) if (s != null && !s.IsLinear(1e-6)) { allLine = false; break; }
+                if (allLine)
+                {
+                    var arr = new Point3d[segs.Length];
+                    for (int i = 0; i < segs.Length; i++) arr[i] = segs[i].PointAtStart;
+                    return arr;
+                }
+            }
+            return SampleCurve(pc, chord); // 곡선 세그먼트 포함 → 샘플 폴백
+        }
+
+        /// <summary>닫힌 2D loop 들을 margin 만큼 안쪽으로 인셋 (outer 축소, hole 확대).</summary>
+        private static List<Curve> InsetLoops(List<Curve> loops, double margin, double tol)
+        {
+            if (loops == null || loops.Count == 0 || margin <= 1e-9) return loops;
+            Curve outer = null; double bestA = -1; var holes = new List<Curve>();
+            foreach (var lp in loops) { double a = LoopArea(lp); if (a > bestA) { if (outer != null) holes.Add(outer); bestA = a; outer = lp; } else holes.Add(lp); }
+            var outList = new List<Curve>();
+            outList.Add(OffsetClosedPick(outer, margin, tol, true) ?? outer);
+            foreach (var h in holes) outList.Add(OffsetClosedPick(h, margin, tol, false) ?? h);
+            return outList;
+        }
+
+        // 닫힌 곡선을 ±dist 로 offset 한 뒤 wantSmaller 면 더 작은 면적, 아니면 더 큰 면적 결과를 선택.
+        private static Curve OffsetClosedPick(Curve loop, double dist, double tol, bool wantSmaller)
+        {
+            if (loop == null) return null;
+            try
+            {
+                var pos = loop.Offset(Plane.WorldXY, dist, tol, CurveOffsetCornerStyle.Sharp);
+                var neg = loop.Offset(Plane.WorldXY, -dist, tol, CurveOffsetCornerStyle.Sharp);
+                Curve cp = JoinFirstClosed(pos), cn = JoinFirstClosed(neg);
+                if (cp == null && cn == null) return null;
+                if (cp == null) return cn;
+                if (cn == null) return cp;
+                double ap = LoopArea(cp), an = LoopArea(cn);
+                return wantSmaller ? (ap <= an ? cp : cn) : (ap >= an ? cp : cn);
+            }
+            catch { return null; }
+        }
+
+        private static Curve JoinFirstClosed(Curve[] arr)
+        {
+            if (arr == null || arr.Length == 0) return null;
+            var j = Curve.JoinCurves(arr, 0.01);
+            if (j != null) foreach (var c in j) if (c != null && c.IsClosed) return c;
+            return (arr.Length == 1 && arr[0] != null && arr[0].IsClosed) ? arr[0] : null;
+        }
+
+        private static double MinDistToLoops(Point3d uv, List<Curve> loops)
+        {
+            double md = double.MaxValue;
+            if (loops == null) return md;
+            foreach (var lp in loops)
+            {
+                double t;
+                if (lp != null && lp.ClosestPoint(uv, out t))
+                {
+                    double d = lp.PointAt(t).DistanceTo(uv);
+                    if (d < md) md = d;
+                }
+            }
+            return md;
+        }
+
+        private static bool InRegion(Point3d uv, Curve outer, List<Curve> holes, double tol)
+        {
+            if (outer == null) return true;
+            if (outer.Contains(uv, Plane.WorldXY, tol) != PointContainment.Inside) return false;
+            if (holes != null) foreach (var h in holes) if (h != null && h.Contains(uv, Plane.WorldXY, tol) == PointContainment.Inside) return false;
+            return true;
+        }
+
+        private static double LoopArea(Curve c)
+        {
+            try { var amp = AreaMassProperties.Compute(c); if (amp != null) return Math.Abs(amp.Area); } catch { }
+            var bb = c.GetBoundingBox(true);
+            return (bb.Max.X - bb.Min.X) * (bb.Max.Y - bb.Min.Y);
+        }
+
+        /// <summary>점 p 를 dir(양/음) 방향 ray 로 mesh 에 투영. 가장 가까운 교차점 반환. 교차 없으면 false(=경계 밖).</summary>
+        private static bool ProjectOntoMesh(Mesh mesh, Point3d p, Vector3d dir, double rayLen, out Point3d hit)
+        {
+            hit = p;
+            var line = new Line(p - dir * rayLen, p + dir * rayLen);
+            int[] faceIds;
+            var pts = Rhino.Geometry.Intersect.Intersection.MeshLine(mesh, line, out faceIds);
+            if (pts == null || pts.Length == 0) return false;
+            double best = double.MaxValue;
+            foreach (var q in pts)
+            {
+                double d = q.DistanceTo(p);
+                if (d < best) { best = d; hit = q; }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// 평행 투영 전략 공통 프레임: 선택 면 평균 normal(미러 보정) → World 축 snap = 투영 방향 avgN.
+        /// 평면 내 격자축 Ti/Tj 는 가장 가까운 World 축에 정렬(기본 0/90°). 사용자 회전은 호출측에서 적용.
+        /// seed = centroid → 표면 snap (실패 시 centroid).
+        /// </summary>
+        private static bool ComputeProjectionFrame(Brep brep, IList<int> faceIndices, HashSet<int> faceSet,
+                Vector3d refDir,
+                out Vector3d avgN, out Vector3d Ti, out Vector3d Tj,
+                out Point3d seedSurf, out BoundingBox sbb, out double bboxDiag)
+        {
+            avgN = Vector3d.ZAxis; Ti = Vector3d.XAxis; Tj = Vector3d.YAxis;
+            seedSurf = Point3d.Origin; sbb = BoundingBox.Empty; bboxDiag = 0;
+
+            Vector3d sumN = Vector3d.Zero, sumCenter = Vector3d.Zero;
+            int validCount = 0;
+            foreach (int fi in faceIndices)
+            {
+                var face = brep.Faces[fi];
+                double fuMin, fuMax, fvMin, fvMax;
+                GetFaceUvBox(face, out fuMin, out fuMax, out fvMin, out fvMax);
+                Point3d c; Vector3d du, dv;
+                if (!EvalDeriv(face, 0.5 * (fuMin + fuMax), 0.5 * (fvMin + fvMax), out c, out du, out dv)) continue;
+                if (du.Length < 1e-9 || dv.Length < 1e-9) continue;
+                var n = Vector3d.CrossProduct(du, dv);
+                if (n.Length < 1e-9) continue;
+                n.Unitize();
+                if (face.OrientationIsReversed) n = -n; // 미러면 normal 복원
+                sumN += n; sumCenter += (Vector3d)c; validCount++;
+            }
+            if (validCount == 0) return false;
+            Point3d centroidPt = new Point3d(sumCenter / validCount);
+            if (sumN.Length < 1e-6) return false;
+            avgN = sumN; avgN.Unitize();
+
+            double aX = Math.Abs(avgN.X), aY = Math.Abs(avgN.Y), aZ = Math.Abs(avgN.Z);
+            if (aZ > 0.9 && aZ >= aX && aZ >= aY) avgN = new Vector3d(0, 0, avgN.Z > 0 ? 1 : -1);
+            else if (aY > 0.9 && aY >= aX && aY >= aZ) avgN = new Vector3d(0, avgN.Y > 0 ? 1 : -1, 0);
+            else if (aX > 0.9 && aX >= aY && aX >= aZ) avgN = new Vector3d(avgN.X > 0 ? 1 : -1, 0, 0);
+
+            // Ti 후보 (refDir → World 축 fallback)
+            Vector3d Ti0 = Vector3d.Zero;
+            if (refDir.Length > 1e-9)
+            {
+                var rp = refDir - (refDir * avgN) * avgN;
+                if (rp.Length > 1e-6) { rp.Unitize(); Ti0 = rp; }
+            }
+            if (Ti0.Length < 1e-6)
+            {
+                foreach (var axis in new[] { Vector3d.YAxis, Vector3d.XAxis, Vector3d.ZAxis })
+                {
+                    var pr = axis - (axis * avgN) * avgN;
+                    if (pr.Length > 1e-6) { pr.Unitize(); Ti0 = pr; break; }
+                }
+            }
+            if (Ti0.Length < 1e-6) return false;
+
+            // 0/90° 정렬: 평면 내 가장 가까운 World 축
+            Vector3d bestAxis = Vector3d.Zero; double bestDot = -1;
+            foreach (var axis in new[] { Vector3d.XAxis, Vector3d.YAxis, Vector3d.ZAxis })
+            {
+                var pr = axis - (axis * avgN) * avgN;
+                if (pr.Length < 1e-6) continue;
+                pr.Unitize();
+                double dot = pr * Ti0;
+                if (Math.Abs(dot) > bestDot) { bestDot = Math.Abs(dot); bestAxis = (dot >= 0) ? pr : -pr; }
+            }
+            if (bestAxis.Length > 1e-6) Ti0 = bestAxis;
+
+            Ti = Ti0;
+            Tj = Vector3d.CrossProduct(avgN, Ti); Tj.Unitize();
+
+            foreach (int fi in faceIndices) sbb.Union(brep.Faces[fi].GetBoundingBox(true));
+            bboxDiag = sbb.Diagonal.Length;
+            int seedFi;
+            if (!TrySnapToSelectedFacesWithIndex(brep, faceSet, centroidPt, bboxDiag, out seedSurf, out seedFi))
+                seedSurf = centroidPt;
+            return true;
+        }
+
+        /// <summary>선택 면들을 하나의 mesh 로 (평행 투영 ray 교차 + trim 클리핑용). 실패 시 null.</summary>
+        private static Mesh BuildSelectedFacesMesh(Brep brep, HashSet<int> faceSet)
+        {
+            var projMesh = new Mesh();
+            Mesh[] faceMeshes = Mesh.CreateFromBrep(brep, MeshingParameters.Default);
+            if (faceMeshes != null)
+                foreach (int fi in faceSet)
+                    if (fi < faceMeshes.Length && faceMeshes[fi] != null) projMesh.Append(faceMeshes[fi]);
+            if (projMesh.Faces.Count == 0) return null;
+            projMesh.Compact();
+            return projMesh;
+        }
+
+        /// <summary>
+        /// PartialFit 전략 1 (평행 투영): 패턴 한 묶음을 평면에 강체 배치(offset/회전/scale) 후 avgN 방향 투영.
+        /// 표면 밖으로 투영되는 vertex 가 있는 커브는 제거(외곽선/구멍 클리핑). 미러/곡면 무관 균일.
+        /// </summary>
+        // boundaryMode/fadeRings/margin: RealSize 와 동일 개념의 경계 처리(단, 단일 stamp 라 거리 기반).
+        public static List<Curve> TileConnectedPartial_Projection(Brep brep, IList<int> faceIndices,
+                IList<Curve> patternCurves, BoundingBox patternBox,
+                Vector3d refDir, double angleTolRad,
+                double uOffsetMm, double vOffsetMm, double rotationDeg,
+                double scale = 1.0, Point3d? patternCenterOverride = null,
+                int boundaryMode = 0, int fadeRings = 2, double margin = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (patternCurves == null || patternCurves.Count == 0) return result;
+            var info = PatternAnalyzer.Analyze(patternCurves);
+            if (!info.Valid) return result;
+            var faceSet = new HashSet<int>(faceIndices);
+
+            Vector3d avgN, Ti, Tj; Point3d seedSurf; BoundingBox sbb; double bboxDiag;
+            if (!ComputeProjectionFrame(brep, faceIndices, faceSet, refDir, out avgN, out Ti, out Tj, out seedSurf, out sbb, out bboxDiag))
+                return result;
+            var projMesh = BuildSelectedFacesMesh(brep, faceSet);
+            if (projMesh == null) return result;
+            double rayLen = Math.Max(bboxDiag * 2.0, 1.0);
+
+            // 패턴 중심 (평면 위). override 면 그 점, 아니면 seed + (U,V) offset.
+            Point3d planeCenter = patternCenterOverride.HasValue
+                ? patternCenterOverride.Value
+                : seedSurf + uOffsetMm * Ti + vOffsetMm * Tj;
+
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+            double pCx = 0.5 * (patternBox.Min.X + patternBox.Max.X);
+            double pCy = 0.5 * (patternBox.Min.Y + patternBox.Max.Y);
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+            Point3d origin = seedSurf; // To2D 기준 평면 원점
+
+            // 경계 처리용 loop(2D): 삭제+마진 또는 자르기일 때만 초록 경계 사용.
+            // (축소 모드는 초록 경계가 아니라 "패턴이 끝나는 지점"=패턴 bbox 가장자리를 기준으로 함)
+            List<Curve> bLoops = (boundaryMode == 2 || (boundaryMode == 0 && margin > 1e-9))
+                ? BuildPlaneBoundaryLoops(brep, faceIndices, origin, Ti, Tj, chord) : null;
+            double clipTol = Math.Max(1e-4, Math.Min(info.CellW, info.CellH) * 0.01);
+            List<Curve> clipLoops = (boundaryMode == 2 && margin > 1e-9 && bLoops != null && bLoops.Count > 0)
+                ? InsetLoops(bLoops, margin, clipTol) : bLoops;
+            double fadeDist = Math.Max(1e-6, Math.Max(1, fadeRings) * Math.Min(info.PitchU, info.PitchV));
+            // 축소 기준 = 패턴 bbox 가장자리 (패턴 공간)
+            double pbMinX = patternBox.Min.X, pbMaxX = patternBox.Max.X;
+            double pbMinY = patternBox.Min.Y, pbMaxY = patternBox.Max.Y;
+
+            // 패턴 공간 점(px,py) → 평면 3D. es = 구멍 자체 중심(ccx,ccy) 기준 축소 배율.
+            Func<double, double, double, double, double, Point3d> ToPlane3D = (px, py, es, ccx, ccy) =>
+            {
+                double sx = ccx + (px - ccx) * es;
+                double sy = ccy + (py - ccy) * es;
+                double offX = (sx - pCx) * scale;
+                double offY = (sy - pCy) * scale;
+                double offRX = offX * cosR - offY * sinR;
+                double offRY = offX * sinR + offY * cosR;
+                return planeCenter + offRX * Ti + offRY * Tj;
+            };
+
+            foreach (var c in patternCurves)
+            {
+                var pts = SampleCurve(c, chord);
+                if (pts == null || pts.Length < 2) continue;
+
+                double ccx = 0, ccy = 0;
+                foreach (var p in pts) { ccx += p.X; ccy += p.Y; }
+                ccx /= pts.Length; ccy /= pts.Length;
+
+                Point3d center3D = ToPlane3D(ccx, ccy, 1.0, ccx, ccy);
+
+                double cellScale = 1.0;
+                if (boundaryMode == 1) // 축소: 기준 = 패턴이 끝나는 지점(패턴 bbox 가장자리)
+                {
+                    double dEdge = Math.Min(Math.Min(ccx - pbMinX, pbMaxX - ccx),
+                                            Math.Min(ccy - pbMinY, pbMaxY - ccy));
+                    cellScale = Math.Min(1.0, Math.Max(0.0, dEdge) / fadeDist);
+                    if (cellScale < 0.06) continue;
+                }
+                else if (boundaryMode == 0 && margin > 1e-9 && bLoops != null) // 삭제 + 마진: 인셋 밖 제거
+                {
+                    double dEff = MinDistToLoops(To2D(center3D, origin, Ti, Tj), bLoops) - margin;
+                    if (dEff <= 0) continue;
+                }
+
+                if (boundaryMode == 2) // 자르기: 경계에 맞춰 클립
+                {
+                    var poly = new List<Point3d>();
+                    foreach (var p in pts)
+                        poly.Add(To2D(ToPlane3D(p.X, p.Y, 1.0, ccx, ccy), origin, Ti, Tj));
+                    ClipPolyAndProject(result, poly, center3D, Ti, Tj, avgN, origin, rayLen, projMesh, clipLoops, chord, clipTol);
+                    continue;
+                }
+
+                // 삭제/축소: 전체 vertex 투영, 하나라도 면 밖이면 제거
+                var mapped = new Point3d[pts.Length];
+                bool ok = true;
+                for (int k = 0; k < pts.Length; k++)
+                {
+                    Point3d fp = ToPlane3D(pts[k].X, pts[k].Y, cellScale, ccx, ccy);
+                    Point3d hit;
+                    if (!ProjectOntoMesh(projMesh, fp, avgN, rayLen, out hit)) { ok = false; break; }
+                    mapped[k] = hit;
+                }
+                if (!ok) continue;
+                var crv = new PolylineCurve(mapped);
+                if (crv.IsValid) result.Add(crv);
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Stretch 전략 1 (평행 투영): 영역을 nU×nV 로 나눠 비균일 스케일한 패턴을 평면에 배치 후 avgN 방향 투영.
+        /// 표면 밖 투영 커브는 제거(외곽선 클리핑). 미러/곡면 무관.
+        /// </summary>
+        public static List<Curve> TileConnectedStretch_Projection(Brep brep, IList<int> faceIndices,
+                IList<Curve> patternCurves, BoundingBox patternBox,
+                Vector3d refDir, double angleTolRad,
+                int nU = 1, int nV = 1, double margin = 0,
+                bool flipH = false, bool flipV = false, double rotationDeg = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (patternCurves == null || patternCurves.Count == 0) return result;
+            var info = PatternAnalyzer.Analyze(patternCurves);
+            if (!info.Valid) return result;
+            var faceSet = new HashSet<int>(faceIndices);
+
+            Vector3d avgN, Ti, Tj; Point3d seedSurf; BoundingBox sbb; double bboxDiag;
+            if (!ComputeProjectionFrame(brep, faceIndices, faceSet, refDir, out avgN, out Ti, out Tj, out seedSurf, out sbb, out bboxDiag))
+                return result;
+            var projMesh = BuildSelectedFacesMesh(brep, faceSet);
+            if (projMesh == null) return result;
+            double rayLen = Math.Max(bboxDiag * 2.0, 1.0);
+
+            // 영역 bbox (평면 mm 좌표)
+            double iMinMm = double.MaxValue, iMaxMm = double.MinValue;
+            double jMinMm = double.MaxValue, jMaxMm = double.MinValue;
+            foreach (var corner in sbb.GetCorners())
+            {
+                Vector3d vc = corner - seedSurf;
+                double iv = vc * Ti, jv = vc * Tj;
+                if (iv < iMinMm) iMinMm = iv;
+                if (iv > iMaxMm) iMaxMm = iv;
+                if (jv < jMinMm) jMinMm = jv;
+                if (jv > jMaxMm) jMaxMm = jv;
+            }
+            if (iMinMm >= iMaxMm || jMinMm >= jMaxMm) return result;
+            if (margin > 1e-9)
+            {
+                iMinMm += margin; iMaxMm -= margin; jMinMm += margin; jMaxMm -= margin;
+                if (iMinMm >= iMaxMm || jMinMm >= jMaxMm) return result;
+            }
+
+            double pw = patternBox.Max.X - patternBox.Min.X;
+            double ph2 = patternBox.Max.Y - patternBox.Min.Y;
+            if (pw < 1e-9 || ph2 < 1e-9) return result;
+            double pCx = 0.5 * (patternBox.Min.X + patternBox.Max.X);
+            double pCy = 0.5 * (patternBox.Min.Y + patternBox.Max.Y);
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+            double absC = Math.Abs(cosR), absS = Math.Abs(sinR);
+            double Wrot = pw * absC + ph2 * absS;
+            double Hrot = pw * absS + ph2 * absC;
+
+            nU = Math.Max(1, nU); nV = Math.Max(1, nV);
+            double iSpanMm = iMaxMm - iMinMm, jSpanMm = jMaxMm - jMinMm;
+            double gapX = nU > 1 ? EstimateGap(patternCurves, 0) : 0;
+            double gapY = nV > 1 ? EstimateGap(patternCurves, 1) : 0;
+            double tileWmm = (iSpanMm - (nU - 1) * gapX) / nU;
+            double tileHmm = (jSpanMm - (nV - 1) * gapY) / nV;
+            if (tileWmm < 1e-9 || tileHmm < 1e-9) return result;
+            double scaleX = tileWmm / Wrot, scaleY = tileHmm / Hrot;
+
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+
+            for (int ti = 0; ti < nU; ti++)
+            {
+                for (int tj = 0; tj < nV; tj++)
+                {
+                    double tileCxMm = iMinMm + ti * (tileWmm + gapX) + tileWmm * 0.5;
+                    double tileCyMm = jMinMm + tj * (tileHmm + gapY) + tileHmm * 0.5;
+                    Point3d tileCenterPlane = seedSurf + tileCxMm * Ti + tileCyMm * Tj;
+
+                    foreach (var c in patternCurves)
+                    {
+                        var pts = SampleCurve(c, chord);
+                        var mapped = new Point3d[pts.Length];
+                        bool ok = true;
+                        for (int k = 0; k < pts.Length; k++)
+                        {
+                            double vx = pts[k].X, vy = pts[k].Y;
+                            if (flipH) vx = patternBox.Max.X + patternBox.Min.X - vx;
+                            if (flipV) vy = patternBox.Max.Y + patternBox.Min.Y - vy;
+                            double offX = vx - pCx, offY = vy - pCy;
+                            double offRX = offX * cosR - offY * sinR;
+                            double offRY = offX * sinR + offY * cosR;
+                            double offWX = offRX * scaleX, offWY = offRY * scaleY;
+                            Point3d flatPlanePt = tileCenterPlane + offWX * Ti + offWY * Tj;
+                            Point3d hit;
+                            if (!ProjectOntoMesh(projMesh, flatPlanePt, avgN, rayLen, out hit)) { ok = false; break; }
+                            mapped[k] = hit;
+                        }
+                        if (!ok) continue;
+                        var crv = new PolylineCurve(mapped);
+                        if (crv.IsValid) result.Add(crv);
+                    }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
         /// "실제 크기" 메인 (Surface Walking BFS):
         ///   - 패턴을 천처럼 표면 위에 입히는 방식. 각 cell 이 이웃에서 surface 위로 정확히 PitchU/V world 거리 walking
         ///   - 곡률 무관 동일 spacing (사용자 요구 #4)
@@ -797,7 +1700,7 @@ namespace Plugin01
         ///   - 모든 cell 이 이웃과 surface 따라 연결 → seam 자연 연속 (사용자 요구 #3, #5)
         ///   - 5개 면을 단일한 통합 면으로 인식 (사용자 요구 #5)
         /// </summary>
-        public static List<Curve> TileConnectedRealSizeFit(Brep brep, IList<int> faceIndices,
+        private static List<Curve> TileConnectedRealSizeFit_WalkingLegacy(Brep brep, IList<int> faceIndices,
                                                             PatternInfo info, Vector3d refDir, double angleTolRad,
                                                             double rotationDeg = 0)
         {
@@ -823,6 +1726,9 @@ namespace Plugin01
                 var n = Vector3d.CrossProduct(du, dv);
                 if (n.Length < 1e-9) continue;
                 n.Unitize();
+                // 미러로 만든 면은 du×dv 가 뒤집혀 있음 → OrientationIsReversed 로 진짜 바깥 방향 복원.
+                // (보정 안 하면 미러면 normal 이 합산에서 상쇄돼 avgN 이 망가짐)
+                if (face.OrientationIsReversed) n = -n;
                 avgN += n;
                 sumCenter += (Vector3d)c;
                 validCount++;
@@ -917,6 +1823,7 @@ namespace Plugin01
                 Vector3d curN = Vector3d.CrossProduct(curDu, curDv);
                 if (curN.Length < 1e-9) continue;
                 curN.Unitize();
+                if (curFace.OrientationIsReversed) curN = -curN; // 미러면 normal 복원 → Tj_local 부호 일관
                 Vector3d Ti_localCur = Ti_world - (Ti_world * curN) * curN;
                 if (Ti_localCur.Length < 1e-6) continue;
                 Ti_localCur.Unitize();
@@ -947,8 +1854,9 @@ namespace Plugin01
                     double actualWalk = nextPt.DistanceTo(current.Pt);
                     if (actualWalk < dists[dirIdx] * 0.3 || actualWalk > dists[dirIdx] * 2.0) continue;
 
-                    // C. World-space dedup: 기존 cell 중 0.7 × Pitch 안에 있는 것 있으면 skip
-                    double dedupDist = Math.Min(info.PitchU, info.PitchV) * 0.7;
+                    // C. World-space dedup: 기존 cell 중 0.5 × Pitch 안에 있는 것 있으면 skip
+                    //    (인접 셀은 최소 1.0×Pitch 떨어지므로 0.5 는 곡률로 접힌 중복만 제거 → 정상 셀 보존)
+                    double dedupDist = Math.Min(info.PitchU, info.PitchV) * 0.5;
                     bool isDup = false;
                     foreach (var existing in placed.Values)
                     {
@@ -965,7 +1873,7 @@ namespace Plugin01
             // 여러 패스 수행해서 BFS 가 닿지 못한 corner 와 transition 영역 채움
             bool gapFillProgressed = true;
             int gapFillIter = 0;
-            while (gapFillProgressed && gapFillIter < 8)
+            while (gapFillProgressed && gapFillIter < 40)
             {
                 gapFillProgressed = false;
                 gapFillIter++;
@@ -986,6 +1894,7 @@ namespace Plugin01
                     Vector3d nL = Vector3d.CrossProduct(duL, dvL);
                     if (nL.Length < 1e-9) continue;
                     nL.Unitize();
+                    if (face.OrientationIsReversed) nL = -nL; // 미러면 normal 복원 → Tj_loc 부호 일관
                     Vector3d Ti_loc = Ti_world - (Ti_world * nL) * nL;
                     if (Ti_loc.Length < 1e-6) continue;
                     Ti_loc.Unitize();
@@ -1011,7 +1920,7 @@ namespace Plugin01
                         if (smG > distsG[d] * 1.2) continue;
                         double awG = nextG.DistanceTo(current.Pt);
                         if (awG < distsG[d] * 0.3 || awG > distsG[d] * 2.2) continue;
-                        double dedupG = Math.Min(info.PitchU, info.PitchV) * 0.7;
+                        double dedupG = Math.Min(info.PitchU, info.PitchV) * 0.5;
                         bool dupG = false;
                         foreach (var ex in placed.Values)
                         {
@@ -1048,7 +1957,7 @@ namespace Plugin01
 
             // Direct snap max: bbox 전체까지 (가장 멀리 휜 surface 도 도달)
             double directSnapMax = Math.Max(Math.Max(info.PitchU, info.PitchV) * 10.0, bboxDiag);
-            double directDedup = Math.Min(info.PitchU, info.PitchV) * 0.5;
+            double directDedup = Math.Min(info.PitchU, info.PitchV) * 0.45;
 
             for (int kiD = iStartD; kiD <= iEndD; kiD++)
             {
@@ -1089,6 +1998,7 @@ namespace Plugin01
                 Vector3d N = Vector3d.CrossProduct(duVec, dvVec);
                 if (N.Length < 1e-9) continue;
                 N.Unitize();
+                if (snapFace.OrientationIsReversed) N = -N; // 미러면 normal 복원 → Tj_local/hex 방향 일관
 
                 // Ti_local = Ti_world projected onto local tangent plane (consistent orientation)
                 var Ti_local = Ti_world - (Ti_world * N) * N;
@@ -1098,7 +2008,11 @@ namespace Plugin01
 
                 // Vertex 가 선택 면의 UV TRIM 안에 있어야만 통과 (boundary 너머 cell 정확히 reject)
                 // 거리 검사가 아닌 trim 검사 → boundary 부근 cell 도 깨끗히 제거
-                double vertexSnapMax = Math.Min(info.PitchU, info.PitchV) * 1.5;
+                double vertexSnapMax = Math.Min(info.PitchU, info.PitchV) * 2.0;
+                // 내부 seam(선택된 두 면이 만나는 공유 경계)은 통과시키고, 진짜 바깥 경계(naked edge)만 거부.
+                // → 면 사이 이음새에서 셀이 통째로 사라져 생기던 줄 모양 공백 제거.
+                // seamEps: vertex 가 해당 면 surface 위에 "닿아" 있다고 볼 거리.
+                double seamEps = Math.Min(info.PitchU, info.PitchV) * 0.15;
 
                 foreach (var pts in cellPts)
                 {
@@ -1112,31 +2026,41 @@ namespace Plugin01
                         double dyR = dx * sinR + dy * cosR;
                         Point3d flat = cellCenter3d + dxR * Ti_local + dyR * Tj_local;
 
-                        // Vertex 가 어느 선택 면의 trim Interior 안에 있는지 검사
-                        bool vertexFound = false;
-                        double bestVertexDist = double.MaxValue;
-                        Point3d bestVertexPt = flat;
+                        // 1) Interior 우선: 어느 선택 면의 trim 내부에 있으면 그 면으로 snap.
+                        // 2) 아니면 seam 검사: 두 개 이상의 선택 면 surface 에 동시에 닿아 있으면
+                        //    (= 내부 공유 이음새) 통과. 한 면에만 닿으면 바깥 경계 → 거부.
+                        bool interiorFound = false;
+                        double bestInteriorDist = double.MaxValue;
+                        Point3d bestInteriorPt = flat;
+                        int onSurfaceCount = 0;
+                        double bestSeamDist = double.MaxValue;
+                        Point3d bestSeamPt = flat;
                         foreach (int vfi in faceSet)
                         {
                             var vf = brep.Faces[vfi];
                             double vU, vV;
                             if (!((Surface)vf).ClosestPoint(flat, out vU, out vV)) continue;
-                            var rel = vf.IsPointOnFace(vU, vV);
-                            // INTERIOR 만 인정 (BOUNDARY 도 거부 → 사용자가 원하는 "boundary 닿는 cell 제거")
-                            if (rel != PointFaceRelation.Interior) continue;
                             var vp = ((Surface)vf).PointAt(vU, vV);
                             double d = vp.DistanceTo(flat);
-                            if (d < bestVertexDist && d < vertexSnapMax)
+                            var rel = vf.IsPointOnFace(vU, vV);
+                            if (rel == PointFaceRelation.Interior && d < vertexSnapMax && d < bestInteriorDist)
                             {
-                                bestVertexDist = d;
-                                bestVertexPt = vp;
-                                vertexFound = true;
+                                bestInteriorDist = d;
+                                bestInteriorPt = vp;
+                                interiorFound = true;
+                            }
+                            // surface 에 닿아 있는지 (Interior/Boundary 무관, 거리만) → seam 판정용
+                            if (d < seamEps)
+                            {
+                                onSurfaceCount++;
+                                if (d < bestSeamDist) { bestSeamDist = d; bestSeamPt = vp; }
                             }
                         }
-                        if (!vertexFound) { allInsideTrim = false; break; }
-                        mapped[k] = bestVertexPt;
+                        if (interiorFound) mapped[k] = bestInteriorPt;
+                        else if (onSurfaceCount >= 2) mapped[k] = bestSeamPt; // 내부 공유 seam → 통과
+                        else { allInsideTrim = false; break; }                 // 바깥 경계 밖 → cell 전체 reject
                     }
-                    if (!allInsideTrim) continue; // 어느 vertex 라도 선택 면 trim Interior 밖 → cell 전체 reject
+                    if (!allInsideTrim) continue;
                     var crv = new PolylineCurve(mapped);
                     if (crv.IsValid) result.Add(crv);
                 }
@@ -1149,7 +2073,13 @@ namespace Plugin01
         /// <summary>
         /// "실제 크기" 다면 버전 — 이전 world-space 방식 (참조용 보존).
         /// </summary>
-        private static List<Curve> TileConnectedRealSizeFit_StrategyTwo_Disabled(Brep brep, IList<int> faceIndices,
+        /// <summary>
+        /// RealSize 전략 2: 평균 normal world-space flat lattice 투영.
+        /// 곡면 walking 대신 평면 격자를 한 번에 surface 로 투영 → snap.
+        /// 다면(multi-face) / 평면 위주 / sharp 각도로 만나는 면들에 강함
+        /// (전략 1 Surface Walking 이 면 전환에서 drift 하는 케이스의 대안).
+        /// </summary>
+        public static List<Curve> TileConnectedRealSizeFit_StrategyTwo(Brep brep, IList<int> faceIndices,
                                                             PatternInfo info, Vector3d refDir, double angleTolRad,
                                                             double rotationDeg = 0)
         {
@@ -1158,7 +2088,7 @@ namespace Plugin01
             if (info == null || !info.Valid || info.UnitCells.Count == 0) return result;
             var faceSet = new HashSet<int>(faceIndices);
 
-            // === Strategy 2 (참조용 보존): 평균 normal world-space flat lattice ===
+            // === Strategy 2: 평균 normal world-space flat lattice ===
             // 누적된 케이스 1~4 fix 모두 통합:
             //   - cell 위치 = world-space lattice → surface snap (phase drift 없음)
             //   - hex 모양 = 로컬 tangent plane (단단한 hex 모양 보존)
@@ -1236,6 +2166,31 @@ namespace Plugin01
                         Tj_init.Unitize();
                         break;
                     }
+                }
+            }
+
+            // 기본 0/90° 원칙: Ti 를 평면 내에서 가장 가까운 World 축(의 평면 투영)에 정렬.
+            // (refDir/avgDu 의 미세한 tilt 제거 → 회전 슬라이더 0 일 때 정확히 수직/수평)
+            {
+                Vector3d bestAxis = Vector3d.Zero;
+                double bestDot = -1;
+                foreach (var axis in new[] { Vector3d.XAxis, Vector3d.YAxis, Vector3d.ZAxis })
+                {
+                    var proj = axis - (axis * avgN) * avgN; // 평면에 투영 (avgN 과 평행한 축은 0)
+                    if (proj.Length < 1e-6) continue;
+                    proj.Unitize();
+                    double dot = proj * Ti_init;
+                    if (Math.Abs(dot) > bestDot)
+                    {
+                        bestDot = Math.Abs(dot);
+                        bestAxis = (dot >= 0) ? proj : -proj; // 원래 Ti 방향(부호) 유지
+                    }
+                }
+                if (bestAxis.Length > 1e-6)
+                {
+                    Ti_init = bestAxis;
+                    Tj_init = Vector3d.CrossProduct(avgN, Ti_init);
+                    Tj_init.Unitize();
                 }
             }
 
@@ -1411,6 +2366,9 @@ namespace Plugin01
                 var n = Vector3d.CrossProduct(du, dv);
                 if (n.Length < 1e-9) continue;
                 n.Unitize();
+                // 미러로 만든 면은 du×dv 가 뒤집혀 있음 → OrientationIsReversed 로 진짜 바깥 방향 복원.
+                // (보정 안 하면 미러면 normal 이 합산에서 상쇄돼 avgN 이 망가짐)
+                if (face.OrientationIsReversed) n = -n;
                 avgN += n;
                 sumCenter += (Vector3d)c;
                 validCount++;
@@ -1713,6 +2671,9 @@ namespace Plugin01
                 var n = Vector3d.CrossProduct(du, dv);
                 if (n.Length < 1e-9) continue;
                 n.Unitize();
+                // 미러로 만든 면은 du×dv 가 뒤집혀 있음 → OrientationIsReversed 로 진짜 바깥 방향 복원.
+                // (보정 안 하면 미러면 normal 이 합산에서 상쇄돼 avgN 이 망가짐)
+                if (face.OrientationIsReversed) n = -n;
                 avgN += n;
                 sumCenter += (Vector3d)c;
                 validCount++;
