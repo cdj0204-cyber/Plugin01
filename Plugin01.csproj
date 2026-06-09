@@ -39,4 +39,13 @@
     </Reference>
   </ItemGroup>
 
+  <!-- WPF (Windows 한정): Eto DropDown 항목 텍스트 세로중앙 정렬 등 네이티브 미세조정용.
+       프레임워크 어셈블리이므로 런타임에 별도 복사 안 함(Private=false). -->
+  <ItemGroup>
+    <Reference Include="PresentationFramework"><Private>false</Private></Reference>
+    <Reference Include="PresentationCore"><Private>false</Private></Reference>
+    <Reference Include="WindowsBase"><Private>false</Private></Reference>
+    <Reference Include="System.Xaml"><Private>false</Private></Reference>
+  </ItemGroup>
+
 </Project>

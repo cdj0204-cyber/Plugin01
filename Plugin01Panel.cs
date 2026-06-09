@@ -35,6 +35,19 @@ namespace Plugin01
         private List<Curve> _manualPunchCurves = null; // null이면 _lastTiledIds 사용
 
         private readonly CheckBox _autoConnect = new CheckBox { Text = "연결면 자동 선택 (끄면 면 직접 다중 선택)", Checked = true };
+        private Button _btnSurface; // 선택/해제 토글 버튼
+        private Button _btnPattern; // 패턴 커브 직접 선택/해제 토글 버튼
+        private Button _btnPreview; // 미리보기/지우기 토글 버튼
+        private Button _btnPunchFaces; // 천공 벽면 선택/해제 토글 버튼
+        private Button _btnCutterPreview; // 커터 미리보기/지우기 토글 버튼
+        private Button _btnInteractive;   // 패턴 위치 조절 (인터랙티브)
+        private Button _btnPickPunchCurves; // 천공 커브 직접 선택
+
+        // 인터랙티브 배치로 고정한 위치 + 재계산 함수 (회전° 옵션으로 실시간 갱신용)
+        private Func<Point3d?, List<Curve>> _placeRecompute;
+        private Point3d? _placeCenter;
+        private bool _patternFromDirectSelect = false; // true 면 직접 선택한 커브 사용 중
+        private List<Curve> _importedPattern = new List<Curve>(); // SVG 로 불러온 원본 패턴(직접선택 해제 시 복귀)
         private readonly DropDown _ddMode = new DropDown();
         private readonly DropDown _ddStrategy = new DropDown();
         private readonly NumericStepper _nu = new NumericStepper { Value = 1, MinValue = 1, MaxValue = 1000, DecimalPlaces = 0, Width = 60 };
@@ -73,32 +86,191 @@ namespace Plugin01
 
         private readonly TilePreviewConduit _preview = new TilePreviewConduit();
 
+        // 단계별 접이식(드롭다운) 섹션 + 완료 인디케이터(초록 ●)
+        private Expander _exp1, _exp2, _exp3, _exp4;
+        private readonly Label _ind1 = MakeIndicator();
+        private readonly Label _ind2 = MakeIndicator();
+        private readonly Label _ind3 = MakeIndicator();
+        private readonly Label _ind4 = MakeIndicator();
+
+        private static readonly Color DoneColor = Color.FromArgb(40, 180, 70);
+        private static readonly Color TodoColor = Color.FromArgb(170, 170, 170);
+
+        private static Label MakeIndicator() =>
+            new Label { Text = "●", TextColor = TodoColor, Font = SystemFonts.Bold() };
+
+        // ===== 방식 드롭다운 아이콘 (코드로 직접 그림, 외부 이미지 파일 불필요) =====
+        // 아이콘과 텍스트를 "한 비트맵"에 함께 그려 세로 정렬을 완전히 제어한다.
+        // (Eto/WPF 항목 템플릿의 텍스트 세로정렬을 외부에서 못 바꾸기 때문)
+        private const int ModeIconSize = 28;
+        private static readonly Color IconColor = Color.FromArgb(55, 95, 170);   // 파란 외곽/도형
+        private static readonly Color ModeTextColor = Color.FromArgb(30, 30, 30);
+
+        private static Eto.Drawing.Font ModeFont()
+        {
+            try { return new Eto.Drawing.Font("Malgun Gothic", 9f); } // 한글 글리프 보장
+            catch { return SystemFonts.Default(); }
+        }
+
+        // 아이콘(왼쪽) + 텍스트(오른쪽)를 한 비트맵에 세로 중앙으로 합쳐 그림.
+        private static Bitmap MakeModeItem(string text, Action<Graphics> drawIcon)
+        {
+            var font = ModeFont();
+            SizeF ts;
+            using (var tmp = new Bitmap(1, 1, PixelFormat.Format32bppRgba))
+            using (var gg = new Graphics(tmp))
+                ts = gg.MeasureString(font, text);
+
+            int s = ModeIconSize, gap = 6, pad = 2;
+            int w = s + gap + (int)Math.Ceiling(ts.Width) + pad;
+            int h = s;
+            var bmp = new Bitmap(w, h, PixelFormat.Format32bppRgba);
+            using (var g = new Graphics(bmp))
+            {
+                g.AntiAlias = true;
+                g.Clear(Colors.Transparent);
+                drawIcon(g);                       // 0..s 영역(세로 전체)에 아이콘 → 세로 중앙
+                float ty = (h - ts.Height) / 2f;   // 텍스트도 세로 중앙
+                g.DrawText(font, ModeTextColor, s + gap, ty, text);
+            }
+            return bmp;
+        }
+
+        // 한 장 늘려 맞춤(Stretch): 4개의 점 + 각 점에서 대각선 바깥으로 향하는 화살표 → 늘어남.
+        private static void DrawStretchIcon(Graphics g)
+        {
+            int s = ModeIconSize;
+            var pen = new Pen(IconColor, 1.6f);
+            var brush = new SolidBrush(IconColor);
+            float c = s / 2f;
+            float d = s * 0.16f, r = s * 0.10f;
+            float startOff = d + s * 0.07f, tipOff = d + s * 0.27f, barb = s * 0.14f;
+            int[] sgn = { -1, 1 };
+            foreach (int sx in sgn)
+                foreach (int sy in sgn)
+                {
+                    float dotx = c + sx * d, doty = c + sy * d;
+                    g.FillEllipse(brush, dotx - r, doty - r, 2 * r, 2 * r);
+                    float ax = c + sx * startOff, ay = c + sy * startOff;
+                    float tx = c + sx * tipOff, ty = c + sy * tipOff;
+                    g.DrawLine(pen, ax, ay, tx, ty);
+                    g.DrawLine(pen, tx, ty, tx - sx * barb, ty);
+                    g.DrawLine(pen, tx, ty, tx, ty - sy * barb);
+                }
+        }
+
+        // 실제 크기-패턴 분석 적용(RealSize): 실제 크기 도형이 면 전체에 격자로 반복(3x3 점).
+        private static void DrawTiledIcon(Graphics g)
+        {
+            int s = ModeIconSize;
+            var brush = new SolidBrush(IconColor);
+            float m = s * 0.14f, gap = (s - 2 * m) / 3f, r = gap * 0.30f;
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                {
+                    float cx = m + gap * (i + 0.5f), cy = m + gap * (j + 0.5f);
+                    g.FillEllipse(brush, cx - r, cy - r, 2 * r, 2 * r);
+                }
+        }
+
+        // 실제 크기-패턴 부분적용(PartialFit): 면(테두리) 안 좌상단에만 작은 묶음(2x2 점) 배치.
+        private static void DrawPartialIcon(Graphics g)
+        {
+            int s = ModeIconSize;
+            var pen = new Pen(IconColor, 1.6f);
+            var brush = new SolidBrush(IconColor);
+            float fm = s * 0.12f;
+            g.DrawRectangle(pen, fm, fm, s - 2 * fm, s - 2 * fm); // 면 테두리
+            float start = s * 0.27f, gap = s * 0.21f, r = s * 0.10f;
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                {
+                    float cx = start + i * gap, cy = start + j * gap;
+                    g.FillEllipse(brush, cx - r, cy - r, 2 * r, 2 * r);
+                }
+        }
+
+        // 단계 완료 표시 + (완료 시) 다음 단계 자동 펼치기
+        private void SetStepDone(int step, bool done)
+        {
+            Label ind = step == 1 ? _ind1 : step == 2 ? _ind2 : step == 3 ? _ind3 : _ind4;
+            ind.TextColor = done ? DoneColor : TodoColor;
+            if (done)
+            {
+                var next = step == 1 ? _exp2 : step == 2 ? _exp3 : step == 3 ? _exp4 : null;
+                if (next != null && !next.Expanded) next.Expanded = true;
+            }
+        }
+
+        // 접이식 섹션 헤더: [인디케이터 ●] [굵은 제목]
+        private static Control StepHeader(Label indicator, string title) =>
+            new StackLayout
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 6,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Items = { indicator, new Label { Text = title, Font = SystemFonts.Bold() } }
+            };
+
+        // 섹션 본문을 세로 스택으로 묶음
+        private static StackLayout StepBody(params Control[] items)
+        {
+            var s = new StackLayout
+            {
+                Padding = new Padding(4, 6, 4, 4),
+                Spacing = 8,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch
+            };
+            foreach (var it in items) s.Items.Add(it);
+            return s;
+        }
+
         public Plugin01Panel()
         {
             Title = "Plugin 01 — 패턴 천공";
-            ClientSize = new Size(320, 440);
+            ClientSize = new Size(400, 450);
             Topmost = true;
             Maximizable = false;
             Minimizable = false;
-            Resizable = true;
+            Resizable = true; // 세로는 자유롭게 늘림. 가로는 아래 SizeChanged 에서 400 으로 고정.
+            // 가로폭 400px 고정: 사용자가 폭을 바꾸면 즉시 400 으로 되돌림 (세로 높이는 유지)
+            SizeChanged += (s, e) =>
+            {
+                if (ClientSize.Width != 400)
+                    ClientSize = new Size(400, ClientSize.Height);
+            };
 
             var btnImport = new Button { Text = "SVG 불러오기" };
             btnImport.Click += OnImport;
 
-            var btnSurface = new Button { Text = "대상 표면 선택" };
-            btnSurface.Click += OnPickSurface;
+            _btnSurface = new Button { Text = "대상 표면 선택" };
+            _btnSurface.Click += OnToggleSurface;
 
-            var btnClearSurface = new Button { Text = "대상 표면 선택 해제" };
-            btnClearSurface.Click += OnClearTargetSurface;
+            _btnPattern = new Button { Text = "패턴 커브 직접 선택" };
+            _btnPattern.Click += OnTogglePattern;
 
-            var btnPattern = new Button { Text = "패턴 커브 직접 선택(선택)" };
-            btnPattern.Click += OnPickPattern;
-
-            _ddMode.Items.Add("한 장 늘려 맞춤 (Stretch)");
-            _ddMode.Items.Add("실제 크기 - 패턴 분석 적용 (RealSize)");
-            _ddMode.Items.Add("실제 크기 - 패턴 부분적용 (PartialFit)");
+            // 방식 드롭다운: 아이콘+텍스트를 한 비트맵에 합쳐(세로 중앙 정렬 완전 제어) 이미지로만 표시.
+            // Text 는 비워 별도 텍스트 렌더(상단 정렬)를 막는다.
+            _ddMode.ItemImageBinding = new PropertyBinding<Image>("Image");
+            _ddMode.Items.Add(new ImageListItem { Text = "", Image = MakeModeItem("한 장 늘려 맞춤 (Stretch)", DrawStretchIcon) });
+            _ddMode.Items.Add(new ImageListItem { Text = "", Image = MakeModeItem("실제 크기 - 패턴 분석 적용 (RealSize)", DrawTiledIcon) });
+            _ddMode.Items.Add(new ImageListItem { Text = "", Image = MakeModeItem("실제 크기 - 패턴 부분적용 (PartialFit)", DrawPartialIcon) });
             _ddMode.SelectedIndex = 0;
             _ddMode.SelectedIndexChanged += OnModeChanged;
+
+            // PartialFit 위치 고정 후 회전° 변경 → 같은 위치로 미리보기 실시간 갱신
+            _rotDeg.ValueChanged += (s2, e2) =>
+            {
+                if (_ddMode.SelectedIndex == 2 && _placeRecompute != null
+                    && _preview.Curves != null && _preview.Curves.Count > 0)
+                {
+                    var cur = _placeRecompute(_placeCenter);
+                    _preview.Curves = cur;
+                    _preview.Enabled = true;
+                    UpdatePreviewButtonText();
+                    RhinoDoc.ActiveDoc?.Views.Redraw();
+                }
+            };
 
             // RealSize 전용 알고리즘(전략) 선택 — 대상 표면에 따라 골라 타일링 성공률을 높임
             _ddStrategy.Items.Add("전략 1: 표면 따라 걷기 (곡면/연속면)");
@@ -125,10 +297,16 @@ namespace Plugin01
 
             _rowPartial = new StackLayout
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalContentAlignment = VerticalAlignment.Center,
-                Items = { new Label { Text = "U(mm):" }, _uOff, new Label { Text = "V(mm):" }, _vOff, new Label { Text = "회전°:" }, _rotDeg, new Label { Text = "크기%:" }, _scalePct },
+                Orientation = Orientation.Vertical,
+                Spacing = 4,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Items =
+                {
+                    new StackLayout { Orientation = Orientation.Horizontal, Spacing = 6, VerticalContentAlignment = VerticalAlignment.Center,
+                        Items = { new Label { Text = "U(mm):" }, _uOff, new Label { Text = "V(mm):" }, _vOff } },
+                    new StackLayout { Orientation = Orientation.Horizontal, Spacing = 6, VerticalContentAlignment = VerticalAlignment.Center,
+                        Items = { new Label { Text = "회전°:" }, _rotDeg, new Label { Text = "크기%:" }, _scalePct } }
+                },
                 Visible = false
             };
 
@@ -160,18 +338,24 @@ namespace Plugin01
             _ddBoundary.SelectedIndex = 0;
             _rowBoundary = new StackLayout
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalContentAlignment = VerticalAlignment.Center,
-                Items = { new Label { Text = "경계 처리:" }, _ddBoundary, new Label { Text = "축소 링:" }, _fadeRings },
+                Orientation = Orientation.Vertical,
+                Spacing = 4,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Items =
+                {
+                    new Label { Text = "경계 처리:" },
+                    _ddBoundary,
+                    new StackLayout { Orientation = Orientation.Horizontal, Spacing = 6, VerticalContentAlignment = VerticalAlignment.Center,
+                        Items = { new Label { Text = "축소 링:" }, _fadeRings } }
+                },
                 Visible = false
             };
 
             _rowStrategy = new StackLayout
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalContentAlignment = VerticalAlignment.Center,
+                Orientation = Orientation.Vertical,
+                Spacing = 4,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
                 Items = { new Label { Text = "알고리즘:" }, _ddStrategy },
                 Visible = false
             };
@@ -184,119 +368,96 @@ namespace Plugin01
                 Items = { new Label { Text = "외곽선 마진(mm):" }, _margin }
             };
 
-            var btnPickDir = new Button { Text = "관통 방향 지정" };
-            btnPickDir.Click += OnPickDirection;
-
+            // 방향/기울기/방위 UI 는 제거됨 (벽면 선택 시 관통 방향 자동 설정). 값은 내부적으로만 사용.
             _tiltDeg.ValueChanged += OnAngleChanged;
             _aziDeg.ValueChanged += OnAngleChanged;
-            var rowAngles = new StackLayout
-            {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalContentAlignment = VerticalAlignment.Center,
-                Items = { new Label { Text = "기울기°(Z):" }, _tiltDeg, new Label { Text = "방위°(XY):" }, _aziDeg }
-            };
-            var btnPickPunchCurves = new Button { Text = "천공 커브 직접 선택 (선택)" };
-            btnPickPunchCurves.Click += OnPickPunchCurves;
-            var btnPickPunchFaces = new Button { Text = "천공 대상 벽면 선택" };
-            btnPickPunchFaces.Click += OnPickPunchFaces;
-            var btnClearPunchFaces = new Button { Text = "천공 벽면 선택 해제" };
-            btnClearPunchFaces.Click += OnClearPunchFaces;
+            _btnPickPunchCurves = new Button { Text = "천공 커브 직접 선택 (선택)" };
+            _btnPickPunchCurves.Click += OnPickPunchCurves;
+            _btnPunchFaces = new Button { Text = "천공 대상 벽면 선택" };
+            _btnPunchFaces.Click += OnTogglePunchFaces;
             var rowDraft = new StackLayout
             {
                 Orientation = Orientation.Horizontal,
                 Spacing = 6,
                 VerticalContentAlignment = VerticalAlignment.Center,
-                Items = {
-                    new Label { Text = "구배각도(°):" }, _draftDeg,
-                    new Label { Text = "  (0=직선, +값=−방향단 넓음/+방향단 좁음, −값=반대)" }
-                }
+                Items = { new Label { Text = "구배각도(°):" }, _draftDeg }
             };
             var rowSafety = new StackLayout
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = 6,
-                VerticalContentAlignment = VerticalAlignment.Center,
+                Orientation = Orientation.Vertical,
+                Spacing = 4,
                 Items = {
-                    new Label { Text = "커터 연장 시작단(mm):" }, _safetyStart,
-                    new Label { Text = "끝단(mm):" }, _safetyEnd
+                    new StackLayout { Orientation = Orientation.Horizontal, Spacing = 6, VerticalContentAlignment = VerticalAlignment.Center,
+                        Items = { new Label { Text = "커터 연장 시작단(mm):" }, _safetyStart } },
+                    new StackLayout { Orientation = Orientation.Horizontal, Spacing = 6, VerticalContentAlignment = VerticalAlignment.Center,
+                        Items = { new Label { Text = "끝단(mm):" }, _safetyEnd } }
                 }
             };
-            var btnPreviewCutters = new Button { Text = "커터 미리보기 (Boolean 전)" };
-            btnPreviewCutters.Click += OnPreviewCutters;
-            var btnClearCutterPreview = new Button { Text = "커터 미리보기 지우기" };
-            btnClearCutterPreview.Click += OnClearPreview;
+            _btnCutterPreview = new Button { Text = "커터 미리보기 (Boolean 전)" };
+            _btnCutterPreview.Click += OnToggleCutterPreview;
             var btnPunch = new Button { Text = "천공 실행" };
             btnPunch.Click += OnPunch;
 
-            var btnPreview = new Button { Text = "미리보기" };
-            btnPreview.Click += OnPreview;
+            _btnPreview = new Button { Text = "미리보기" };
+            _btnPreview.Click += OnTogglePreview;
 
-            var btnInteractivePlace = new Button { Text = "패턴 위치 조절 (인터랙티브)" };
-            btnInteractivePlace.Click += OnInteractivePlace;
-
-            var btnClear = new Button { Text = "미리보기 지우기" };
-            btnClear.Click += OnClearPreview;
+            _btnInteractive = new Button { Text = "패턴 위치 조절 (인터랙티브)" };
+            _btnInteractive.Click += OnInteractivePlace;
 
             var btnTile = new Button { Text = "타일링 실행 (확정)" };
             btnTile.Click += OnApply;
 
             Closed += (s, e) => DisableAllPreview();
 
+            _exp1 = new Expander
+            {
+                Header = StepHeader(_ind1, "1. SVG 패턴"),
+                Expanded = true,
+                Content = StepBody(btnImport, _lblImport)
+            };
+
+            _exp2 = new Expander
+            {
+                Header = StepHeader(_ind2, "2. 대상 / 패턴"),
+                Expanded = false,
+                Content = StepBody(_autoConnect, _btnSurface, _lblSurface, _btnPattern, _lblPattern)
+            };
+
+            _exp3 = new Expander
+            {
+                Header = StepHeader(_ind3, "3. 타일링"),
+                Expanded = false,
+                Content = StepBody(
+                    new Label { Text = "방식" }, _ddMode,
+                    _rowCounts, _rowFlips, _rowRealSize, _rowBoundary, _rowStrategy, _rowPartial,
+                    rowMargin, _rowOpenRatio, _lblOpenArea,
+                    _btnPreview, _btnInteractive, btnTile)
+            };
+
+            _exp4 = new Expander
+            {
+                Header = StepHeader(_ind4, "4. 천공"),
+                Expanded = false,
+                Content = StepBody(
+                    _wallOnly, _punchAutoConnect,
+                    _btnPunchFaces, _lblPunchFaces,
+                    _btnPickPunchCurves, _lblPunchCurves, rowDraft, rowSafety,
+                    _btnCutterPreview, btnPunch)
+            };
+
             var contentStack = new StackLayout
             {
                 Padding = new Padding(12),
-                Spacing = 8,
+                Spacing = 6,
                 HorizontalContentAlignment = HorizontalAlignment.Stretch,
                 Items =
                 {
-                    Bold("1. SVG 패턴"),
-                    btnImport,
-                    _lblImport,
+                    _exp1,
+                    _exp2,
+                    _exp3,
+                    _exp4,
                     new Label { Text = " " },
-                    Bold("2. 대상 / 패턴"),
-                    _autoConnect,
-                    btnSurface,
-                    btnClearSurface,
-                    _lblSurface,
-                    btnPattern,
-                    _lblPattern,
-                    new Label { Text = " " },
-                    Bold("3. 타일링"),
-                    new Label { Text = "방식" },
-                    _ddMode,
-                    _rowCounts,
-                    _rowFlips,
-                    _rowRealSize,
-                    _rowBoundary,
-                    _rowStrategy,
-                    _rowPartial,
-                    rowMargin,
-                    _rowOpenRatio,
-                    _lblOpenArea,
-                    btnPreview,
-                    btnClear,
-                    btnInteractivePlace,
-                    btnTile,
-                    new Label { Text = " " },
-                    _lblStatus,
-                    new Label { Text = " " },
-                    Bold("4. 천공"),
-                    btnPickDir,
-                    _lblPunchDir,
-                    rowAngles,
-                    _wallOnly,
-                    _punchAutoConnect,
-                    btnPickPunchFaces,
-                    btnClearPunchFaces,
-                    _lblPunchFaces,
-                    btnPickPunchCurves,
-                    _lblPunchCurves,
-                    rowDraft,
-                    rowSafety,
-                    btnPreviewCutters,
-                    btnClearCutterPreview,
-                    btnPunch
+                    _lblStatus
                 }
             };
 
@@ -308,6 +469,113 @@ namespace Plugin01
                 ExpandContentHeight = false,
                 Content = contentStack
             };
+
+            // 네이티브 컨트롤 생성 후: 드롭다운 텍스트 세로중앙 + 버튼 모서리 둥글게
+            Shown += (s, e) => { CenterDropDownText(_ddMode); ApplyRoundedCorners(); };
+        }
+
+        // 버튼 모서리를 5px 둥글게 (WPF 한정). 호버/클릭 피드백 포함. 실패 시 무시.
+        private const string RoundedXaml =
+@"<ResourceDictionary xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
+  <Style TargetType='Button'>
+    <Setter Property='Background' Value='#F0F0F0'/>
+    <Setter Property='BorderBrush' Value='#ADADAD'/>
+    <Setter Property='BorderThickness' Value='1'/>
+    <Setter Property='Padding' Value='6,3'/>
+    <Setter Property='SnapsToDevicePixels' Value='True'/>
+    <Setter Property='Template'>
+      <Setter.Value>
+        <ControlTemplate TargetType='Button'>
+          <Border x:Name='bd' CornerRadius='5' Background='{TemplateBinding Background}' BorderBrush='{TemplateBinding BorderBrush}' BorderThickness='{TemplateBinding BorderThickness}' SnapsToDevicePixels='True'>
+            <ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center' Margin='{TemplateBinding Padding}'/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property='IsMouseOver' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='#E5F1FB'/>
+              <Setter TargetName='bd' Property='BorderBrush' Value='#3399FF'/>
+            </Trigger>
+            <Trigger Property='IsPressed' Value='True'>
+              <Setter TargetName='bd' Property='Background' Value='#CCE4F7'/>
+              <Setter TargetName='bd' Property='BorderBrush' Value='#2E8AE6'/>
+            </Trigger>
+            <Trigger Property='IsEnabled' Value='False'>
+              <Setter Property='Foreground' Value='#A0A0A0'/>
+              <Setter TargetName='bd' Property='Background' Value='#F5F5F5'/>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+</ResourceDictionary>";
+
+        // 활성(선택됨/미리보기 중) 버튼은 호버 피드백과 같은 연한 파랑으로 유지
+        private static readonly Color ActiveBtnColor = Color.FromArgb(0xE5, 0xF1, 0xFB);
+        private static readonly Color IdleBtnColor = Color.FromArgb(0xF0, 0xF0, 0xF0);
+        private static void SetButtonActive(Button btn, bool active)
+        {
+            if (btn != null) btn.BackgroundColor = active ? ActiveBtnColor : IdleBtnColor;
+        }
+
+        private void ApplyRoundedCorners()
+        {
+            try
+            {
+                var fe = ControlObject as System.Windows.FrameworkElement;
+                if (fe == null) return;
+                var rd = (System.Windows.ResourceDictionary)System.Windows.Markup.XamlReader.Parse(RoundedXaml);
+                fe.Resources.MergedDictionaries.Add(rd); // 이후 생성 버튼(팝업 등)에도 적용
+                var btnStyle = rd[typeof(System.Windows.Controls.Button)] as System.Windows.Style;
+                if (btnStyle != null)
+                    fe.Dispatcher.BeginInvoke(new Action(() =>
+                        ForEachVisual<System.Windows.Controls.Button>(fe, b => b.Style = btnStyle)),
+                        System.Windows.Threading.DispatcherPriority.Loaded);
+            }
+            catch { }
+        }
+
+        // 비주얼 트리에서 특정 타입의 모든 자식에 동작 적용
+        private static void ForEachVisual<T>(System.Windows.DependencyObject root, Action<T> action)
+            where T : System.Windows.DependencyObject
+        {
+            if (root == null) return;
+            int n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < n; i++)
+            {
+                var c = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+                if (c is T t) action(t);
+                ForEachVisual(c, action);
+            }
+        }
+
+        // WPF DropDown 항목/선택부의 아이콘과 텍스트를 모두 세로 중앙 정렬.
+        // (항목 템플릿은 Image+TextBlock 가로 배치라 TextBlock 이 위로 붙음 → 둘 다 Center 로 맞춤)
+        // Windows(WPF) 한정 기능이라 다른 플랫폼/예외 시 그냥 무시.
+        private static void CenterDropDownText(DropDown dd)
+        {
+            try
+            {
+                var cb = dd.ControlObject as System.Windows.Controls.ComboBox;
+                if (cb == null) return;
+
+                // 콘텐츠 블록 전체를 세로 중앙에
+                cb.VerticalContentAlignment = System.Windows.VerticalAlignment.Center;
+
+                // 항목 템플릿 내부 TextBlock 을 세로 중앙 (아이콘 중간높이에 텍스트 중간높이 맞춤)
+                var tbStyle = new System.Windows.Style(typeof(System.Windows.Controls.TextBlock));
+                tbStyle.Setters.Add(new System.Windows.Setter(
+                    System.Windows.FrameworkElement.VerticalAlignmentProperty,
+                    System.Windows.VerticalAlignment.Center));
+                cb.Resources[typeof(System.Windows.Controls.TextBlock)] = tbStyle;
+
+                // 아이콘(Image)도 세로 중앙
+                var imgStyle = new System.Windows.Style(typeof(System.Windows.Controls.Image));
+                imgStyle.Setters.Add(new System.Windows.Setter(
+                    System.Windows.FrameworkElement.VerticalAlignmentProperty,
+                    System.Windows.VerticalAlignment.Center));
+                cb.Resources[typeof(System.Windows.Controls.Image)] = imgStyle;
+            }
+            catch { }
         }
 
         private static Label Bold(string text) =>
@@ -330,6 +598,7 @@ namespace Plugin01
             _rowPartial.Visible = (m == 2);
             _rowOpenRatio.Visible = (m == 1); // 개구율 % 는 RealSize 만. Stretch/PartialFit 은 실제 패턴 면적만 표시
             _lastPreviewArea = -1;
+            _placeRecompute = null; _placeCenter = null; // 모드 바뀌면 인터랙티브 배치 무효화
             UpdateOpenAreaInfo();
         }
 
@@ -364,8 +633,29 @@ namespace Plugin01
             doc.Views.Redraw();
 
             _pattern = curves;
+            _importedPattern = new List<Curve>(curves); // 직접선택 해제 시 복귀용 원본
+            _patternFromDirectSelect = false;
+            _lblPattern.Text = "(불러온 SVG 사용)";
+            UpdatePatternButtonText();
             _lblImport.Text = $"패턴 {curves.Count}개 로드됨";
+            SetStepDone(1, true);
             SetStatus("SVG 불러오기 완료");
+        }
+
+        // 표면 선택 여부에 따라 버튼 텍스트를 갱신 (선택됨 → "선택 해제", 미선택 → "선택")
+        private void UpdateSurfaceButtonText()
+        {
+            bool has = _targetBrep != null && _faceIndices != null && _faceIndices.Count > 0;
+            if (_btnSurface != null) _btnSurface.Text = has ? "대상 표면 선택 해제" : "대상 표면 선택";
+            SetButtonActive(_btnSurface, has);
+        }
+
+        // 하나의 버튼으로 선택/해제 토글
+        private void OnToggleSurface(object sender, EventArgs e)
+        {
+            bool has = _targetBrep != null && _faceIndices != null && _faceIndices.Count > 0;
+            if (has) OnClearTargetSurface(sender, e);
+            else OnPickSurface(sender, e);
         }
 
         private void OnPickSurface(object sender, EventArgs e)
@@ -386,6 +676,7 @@ namespace Plugin01
             {
                 _targetBrep = null; _faceIndices.Clear();
                 _lblSurface.Text = "표면 가져오기 실패";
+                UpdateSurfaceButtonText();
                 SetStatus("표면(BrepFace) 가져오기 실패");
                 return;
             }
@@ -399,6 +690,9 @@ namespace Plugin01
                 double angleTol = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? RhinoMath.ToRadians(1);
                 _faceIndices = FaceGrouping.GrowTangent(_targetBrep, first.FaceIndex, angleTol);
                 _lblSurface.Text = $"표면 선택됨 (자동 연결면 {_faceIndices.Count}개)";
+                SetStepDone(2, _faceIndices.Count > 0);
+                UpdateSurfaceButtonText();
+                if (_punchFaceIndices == null || _punchFaceIndices.Count == 0) AutoSetPunchDir(_faceIndices);
                 SetStatus($"표면 선택 완료 — 탄젠트 연결면 {_faceIndices.Count}개");
                 // outline 도 즉시 업데이트 (else 분기는 함수 끝에서 함)
                 UpdateTargetOutlinePreview();
@@ -418,8 +712,11 @@ namespace Plugin01
                 }
                 _faceIndices = idx;
                 _lblSurface.Text = $"표면 선택됨 (직접 선택 {_faceIndices.Count}개)";
+                SetStepDone(2, _faceIndices.Count > 0);
                 SetStatus($"표면 선택 완료 — 직접 선택 면 {_faceIndices.Count}개");
             }
+            UpdateSurfaceButtonText();
+            if (_punchFaceIndices == null || _punchFaceIndices.Count == 0) AutoSetPunchDir(_faceIndices);
             UpdateTargetOutlinePreview();
         }
 
@@ -454,6 +751,32 @@ namespace Plugin01
             RhinoDoc.ActiveDoc?.Views.Redraw();
         }
 
+        // 직접선택 여부에 따라 버튼 텍스트 갱신
+        private void UpdatePatternButtonText()
+        {
+            if (_btnPattern != null)
+                _btnPattern.Text = _patternFromDirectSelect ? "패턴 커브 선택 해제" : "패턴 커브 직접 선택";
+            SetButtonActive(_btnPattern, _patternFromDirectSelect);
+        }
+
+        // 하나의 버튼으로 직접선택/해제 토글
+        private void OnTogglePattern(object sender, EventArgs e)
+        {
+            if (_patternFromDirectSelect) ClearDirectPattern();
+            else OnPickPattern(sender, e);
+        }
+
+        // 직접 선택 해제 → SVG 로 불러온 패턴으로 복귀(없으면 빈 목록)
+        private void ClearDirectPattern()
+        {
+            _patternFromDirectSelect = false;
+            _pattern = new List<Curve>(_importedPattern);
+            _lblPattern.Text = _importedPattern.Count > 0 ? "(불러온 SVG 사용)" : "(없음)";
+            UpdatePatternButtonText();
+            SetStepDone(1, _pattern.Count > 0);
+            SetStatus("패턴 커브 직접 선택 해제됨");
+        }
+
         private void OnPickPattern(object sender, EventArgs e)
         {
             var gc = new GetObject();
@@ -471,7 +794,10 @@ namespace Plugin01
             if (list.Count == 0) { SetStatus("유효한 커브가 없습니다."); return; }
 
             _pattern = list;
+            _patternFromDirectSelect = true;
             _lblPattern.Text = $"패턴 커브 {list.Count}개 직접 선택됨";
+            UpdatePatternButtonText();
+            SetStepDone(1, true);
             SetStatus("패턴 커브 선택 완료");
         }
 
@@ -856,6 +1182,23 @@ namespace Plugin01
             catch (Exception ex) { SetStatus("타일링 실패: " + ex.Message); return null; }
         }
 
+        // 미리보기 커브가 떠 있는지에 따라 버튼 텍스트 갱신
+        private void UpdatePreviewButtonText()
+        {
+            bool shown = _preview.Curves != null && _preview.Curves.Count > 0;
+            if (_btnPreview != null) _btnPreview.Text = shown ? "미리보기 지우기" : "미리보기";
+            SetButtonActive(_btnPreview, shown);
+            SetButtonActive(_btnInteractive, shown); // 미리보기 실행 중엔 위치조절 버튼도 활성 표시
+        }
+
+        // 하나의 버튼으로 미리보기/지우기 토글
+        private void OnTogglePreview(object sender, EventArgs e)
+        {
+            bool shown = _preview.Curves != null && _preview.Curves.Count > 0;
+            if (shown) OnClearPreview(sender, e);
+            else OnPreview(sender, e);
+        }
+
         private void OnPreview(object sender, EventArgs e)
         {
             var tiled = ComputeTiling();
@@ -864,6 +1207,7 @@ namespace Plugin01
 
             _preview.Curves = tiled;
             _preview.Enabled = true;
+            UpdatePreviewButtonText();
             RhinoDoc.ActiveDoc?.Views.Redraw();
             SetStatus($"미리보기 표시 (확정 전): 커브 {tiled.Count}개");
         }
@@ -880,6 +1224,8 @@ namespace Plugin01
             _preview.Breps = new List<Brep>();
             // outline 은 보존: 선택 면이 살아 있는 동안 항상 보이게
             _preview.Enabled = (_preview.TargetOutline.Count > 0 || _preview.PunchOutline.Count > 0);
+            UpdatePreviewButtonText();
+            UpdateCutterPreviewButtonText();
             RhinoDoc.ActiveDoc?.Views.Redraw();
         }
 
@@ -919,6 +1265,7 @@ namespace Plugin01
 
             DisablePreview();
             doc.Views.Redraw();
+            SetStepDone(3, _lastTiledIds.Count > 0);
             SetStatus($"타일링 확정: 커브 {tiled.Count}개 생성");
         }
 
@@ -1084,12 +1431,21 @@ namespace Plugin01
             }
             double angleTolL = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? Rhino.RhinoMath.ToRadians(1);
 
+            // 전략1(평행투영)은 면 mesh·경계 loop 사전 계산이 무거움 → 드래그 전에 한 번만 만들어 캐시.
+            // (GetPoint 가 modal 이라 드래그 중 경계/마진 옵션은 바뀌지 않으므로 여기서 캡처해도 안전)
+            int boundaryModeL = _ddBoundary.SelectedIndex;
+            int fadeRingsL = (int)_fadeRings.Value;
+            double marginCtxL = Math.Max(0, _margin.Value);
+            SurfaceTiler.PartialProjContext projCtx =
+                (_ddStrategy.SelectedIndex != 1)
+                    ? SurfaceTiler.BuildPartialProjContext(_targetBrep, _faceIndices, patternL, refDirL, boundaryModeL, fadeRingsL, marginCtxL)
+                    : null;
+
             Func<Point3d?, List<Curve>> recompute = (Point3d? overrideCenter) =>
             {
                 try
                 {
                     double scaleL = Math.Max(0.0001, _scalePct.Value / 100.0);
-                    double marginL = Math.Max(0, _margin.Value);
                     List<Curve> res;
                     if (_ddStrategy.SelectedIndex == 1) // 전략 2 → 접평면 스탬프
                     {
@@ -1097,10 +1453,11 @@ namespace Plugin01
                             refDirL, angleTolL, _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter);
                         res = ApplyMarginFilter(res ?? new List<Curve>());
                     }
-                    else                                 // 전략 1 → 평행 투영 (경계 처리 + 마진 내부 처리)
-                        res = SurfaceTiler.TileConnectedPartial_Projection(_targetBrep, _faceIndices, patternL, pBoxL,
-                            refDirL, angleTolL, _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter,
-                            _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginL) ?? new List<Curve>();
+                    else                                 // 전략 1 → 평행 투영 (캐시된 컨텍스트 재사용 → 빠름)
+                        res = (projCtx != null && projCtx.Valid)
+                            ? SurfaceTiler.TilePartialProjectionFromContext(projCtx, patternL, pBoxL,
+                                _uOff.Value, _vOff.Value, _rotDeg.Value, scaleL, overrideCenter) ?? new List<Curve>()
+                            : new List<Curve>();
                     _lastPreviewArea = TotalCurveArea(res); // 인터랙티브 배치 중 실제 패턴 면적 표시
                     UpdateOpenAreaInfo();
                     return res;
@@ -1108,16 +1465,13 @@ namespace Plugin01
                 catch { return new List<Curve>(); }
             };
 
-            // === Phase 1: 위치 조절 ===
+            // === 위치 조절 (좌클릭 시 위치 고정) ===
             var gp1 = new Rhino.Input.Custom.GetPoint();
-            gp1.SetCommandPrompt("패턴 위치 클릭 (표면 위, Esc 취소)");
+            gp1.SetCommandPrompt("패턴 위치 클릭 (좌클릭=위치 고정, Esc 취소). 회전은 회전° 옵션 사용");
 
             List<Curve> dynPreview = recompute(null);
-            Point3d lastSurfacePt = seedSurf;
-            DateTime phase1ClickTime = DateTime.MinValue;
-            DateTime phase2ClickTime = DateTime.MinValue;
+            Point3d lastSurfacePt = seedSurf; // 표면 위 마지막 커서 지점 (클릭 확정 시 이 점 사용)
 
-            gp1.MouseDown += (sm, em) => { phase1ClickTime = DateTime.Now; };
             gp1.MouseMove += (sm, em) =>
             {
                 Point3d? surfacePt = HitBrepFromCursor(em);
@@ -1142,107 +1496,57 @@ namespace Plugin01
             {
                 SetStatus("패턴 위치 조절 취소"); return;
             }
-            var posPt = gp1.Point();
-
-            // === Phase 2: 회전 조절 ===
-            var gp2 = new Rhino.Input.Custom.GetPoint();
-            gp2.SetCommandPrompt("회전 방향 클릭 (Enter 로 회전 유지하며 확정)");
-            gp2.SetBasePoint(posPt, true);
-            gp2.AcceptNothing(true);
-
-            // 회전 기준 — posPt 의 로컬 tangent 평면 위 Ti, Tj 방향
-            Point3d brepCp; double bs, bt; ComponentIndex bci; Vector3d bn;
-            _targetBrep.ClosestPoint(posPt, out brepCp, out bci, out bs, out bt, double.MaxValue, out bn);
-            // local tangent plane normal = surface normal at posPt
-            Vector3d nLoc = bn;
-            if (nLoc.Length < 1e-9) nLoc = Vector3d.CrossProduct(Ti_init, Tj_init);
-            nLoc.Unitize();
-            Vector3d Ti_loc = Ti_init - (Ti_init * nLoc) * nLoc;
-            if (Ti_loc.Length < 1e-6) Ti_loc = Ti_init;
-            Ti_loc.Unitize();
-            Vector3d Tj_loc = Vector3d.CrossProduct(nLoc, Ti_loc);
-
-            List<Curve> dynPreview2 = recompute(posPt);
-
-            gp2.MouseDown += (sm, em) => { phase2ClickTime = DateTime.Now; };
-            gp2.MouseMove += (sm, em) =>
-            {
-                Point3d aimPt = HitBrepFromCursor(em) ?? em.Point;
-                Vector3d dir = aimPt - posPt;
-                double dTi = dir * Ti_loc;
-                double dTj = dir * Tj_loc;
-                if (Math.Abs(dTi) < 1e-9 && Math.Abs(dTj) < 1e-9) return;
-                double newRot = Math.Atan2(dTj, dTi) * 180.0 / Math.PI;
-                _rotDeg.Value = newRot;
-                // posPt 를 override 로 유지 (위치 고정, 회전만 변경)
-                dynPreview2 = recompute(posPt);
-            };
-            gp2.DynamicDraw += (sd, ed) =>
-            {
-                foreach (var c in dynPreview2)
-                    if (c != null) ed.Display.DrawCurve(c, System.Drawing.Color.FromArgb(0, 160, 255), 2);
-                // 회전 기준선 (현재 방향) 시각화
-                ed.Display.DrawLine(posPt, posPt + Ti_loc * 20, System.Drawing.Color.Red, 2);
-            };
-
-            var result2 = gp2.Get();
-
-            // 최종 preview — cursor 위치 override 직접 사용 (slider snap 거치지 않음 → 인터랙티브 결과 그대로 유지)
-            var finalCurves = recompute(posPt);
+            // 클릭 점(gp1.Point())은 표면이 아닌 CPlane 위라 투영이 빗나갈 수 있음 →
+            // 표면 위 마지막 커서 지점(lastSurfacePt)을 위치로 사용해 미리보기를 그대로 유지.
+            // 좌클릭 한 번으로 위치 고정. 회전은 '회전°' 옵션으로 조절.
+            _placeRecompute = recompute; // 회전° 변경 시 같은 위치로 재계산하기 위해 보관
+            _placeCenter = lastSurfacePt;
+            var finalCurves = recompute(lastSurfacePt);
             _preview.Curves = finalCurves;
             _preview.Enabled = true;
+            UpdatePreviewButtonText();
             RhinoDoc.ActiveDoc?.Views.Redraw();
-
-            // 더블클릭 감지: phase1 클릭 ↔ phase2 클릭 시간 차이 < 500ms 면 즉시 베이크
-            bool wasDoubleClick = phase1ClickTime != DateTime.MinValue
-                && phase2ClickTime != DateTime.MinValue
-                && (phase2ClickTime - phase1ClickTime).TotalMilliseconds < 500;
-
-            if (wasDoubleClick)
-            {
-                // 미리보기 그대로 베이크
-                int gi = RhinoDoc.ActiveDoc.Groups.Add("tiled_pattern");
-                var attr = new ObjectAttributes { Name = "tiled_pattern" };
-                attr.AddToGroup(gi);
-                _lastTiledIds.Clear();
-                foreach (var c in finalCurves)
-                {
-                    var id = RhinoDoc.ActiveDoc.Objects.AddCurve(c, attr);
-                    if (id != Guid.Empty) _lastTiledIds.Add(id);
-                }
-                DisablePreview();
-                RhinoDoc.ActiveDoc.Views.Redraw();
-                SetStatus($"더블클릭 → 즉시 베이크: {finalCurves.Count}개 cell. U={_uOff.Value:0.0} V={_vOff.Value:0.0} 회전={_rotDeg.Value:0.0}°");
-            }
-            else
-            {
-                SetStatus($"패턴 위치 조절 완료: U={_uOff.Value:0.0}mm V={_vOff.Value:0.0}mm 회전={_rotDeg.Value:0.0}° — 타일링 실행 으로 베이크");
-            }
+            SetStatus($"패턴 위치 고정: U={_uOff.Value:0.0}mm V={_vOff.Value:0.0}mm — 회전은 '회전°' 옵션으로 조절, '타일링 실행'으로 베이크");
         }
 
         // ============================== 4. 천공 ==============================
 
-        private void OnPickDirection(object sender, EventArgs e)
+        // 선택한 면들의 평균 법선으로 관통 방향을 자동 설정 (벽면 선택 → 그 벽을 수직 관통).
+        private void AutoSetPunchDir(IList<int> faceIndices)
         {
-            // 첫 점
-            var gp1 = new Rhino.Input.Custom.GetPoint();
-            gp1.SetCommandPrompt("관통 방향 시작점");
-            if (gp1.Get() != GetResult.Point) { SetStatus("방향 지정 취소"); return; }
-            Point3d p1 = gp1.Point();
-
-            // 끝점: 시작점에서 커서까지 러버밴드 라인 표시
-            var gp2 = new Rhino.Input.Custom.GetPoint();
-            gp2.SetCommandPrompt("관통 방향 끝점");
-            gp2.DrawLineFromPoint(p1, true);
-            if (gp2.Get() != GetResult.Point) { SetStatus("방향 지정 취소"); return; }
-            Point3d p2 = gp2.Point();
-
-            var v = p2 - p1;
-            if (!v.Unitize()) { SetStatus("방향 길이가 0입니다"); return; }
-            _punchDir = v;
+            if (_targetBrep == null || faceIndices == null || faceIndices.Count == 0) return;
+            Vector3d sumN = Vector3d.Zero;
+            int cnt = 0;
+            foreach (int fi in faceIndices)
+            {
+                if (fi < 0 || fi >= _targetBrep.Faces.Count) continue;
+                var face = _targetBrep.Faces[fi];
+                double uMin = face.Domain(0).T0, uMax = face.Domain(0).T1;
+                double vMin = face.Domain(1).T0, vMax = face.Domain(1).T1;
+                try
+                {
+                    var c2 = face.OuterLoop?.To2dCurve();
+                    if (c2 != null)
+                    {
+                        var bb2 = c2.GetBoundingBox(true);
+                        uMin = bb2.Min.X; uMax = bb2.Max.X; vMin = bb2.Min.Y; vMax = bb2.Max.Y;
+                    }
+                }
+                catch { }
+                Point3d p; Vector3d[] ders;
+                if (!((Surface)face).Evaluate(0.5 * (uMin + uMax), 0.5 * (vMin + vMax), 1, out p, out ders)) continue;
+                if (ders == null || ders.Length < 2) continue;
+                var n = Vector3d.CrossProduct(ders[0], ders[1]);
+                if (n.Length < 1e-9) continue;
+                n.Unitize();
+                if (face.OrientationIsReversed) n = -n; // 미러면 normal 복원
+                sumN += n; cnt++;
+            }
+            if (cnt == 0) return;
+            if (!sumN.Unitize()) return;
+            _punchDir = sumN;
             SyncAnglesFromDir();
             UpdateDirLabel();
-            SetStatus("관통 방향 설정 완료");
         }
 
         private void UpdateDirLabel()
@@ -1274,6 +1578,22 @@ namespace Plugin01
                 UpdateDirLabel();
                 SetStatus($"방향 갱신: 기울기 {_tiltDeg.Value:0.##}° 방위 {_aziDeg.Value:0.##}°");
             }
+        }
+
+        // 천공 벽면 선택 여부에 따라 버튼 텍스트 갱신
+        private void UpdatePunchFacesButtonText()
+        {
+            bool has = _punchFaceIndices != null && _punchFaceIndices.Count > 0;
+            if (_btnPunchFaces != null) _btnPunchFaces.Text = has ? "천공 벽면 선택 해제" : "천공 대상 벽면 선택";
+            SetButtonActive(_btnPunchFaces, has);
+        }
+
+        // 하나의 버튼으로 천공 벽면 선택/해제 토글
+        private void OnTogglePunchFaces(object sender, EventArgs e)
+        {
+            bool has = _punchFaceIndices != null && _punchFaceIndices.Count > 0;
+            if (has) OnClearPunchFaces(sender, e);
+            else OnPickPunchFaces(sender, e);
         }
 
         private void OnPickPunchFaces(object sender, EventArgs e)
@@ -1324,6 +1644,8 @@ namespace Plugin01
                 SetStatus($"천공 벽면 {indices.Count}개 (직접 선택)");
             }
             _punchFaceIndices = indices;
+            AutoSetPunchDir(indices); // 선택한 벽면 법선으로 관통 방향 자동 설정
+            UpdatePunchFacesButtonText();
             UpdatePunchOutlinePreview();
         }
 
@@ -1331,6 +1653,8 @@ namespace Plugin01
         {
             _punchFaceIndices = new List<int>();
             _lblPunchFaces.Text = "천공 벽면: (미선택 → 대상 표면과 동일)";
+            AutoSetPunchDir(_faceIndices); // 대상 표면 법선으로 방향 복귀 (fallback)
+            UpdatePunchFacesButtonText();
             SetStatus("천공 벽면 선택 해제됨");
             UpdatePunchOutlinePreview();
         }
@@ -1341,6 +1665,9 @@ namespace Plugin01
             _targetObjectId = Guid.Empty;
             _faceIndices = new List<int>();
             _lblSurface.Text = "표면 선택 안됨";
+            _placeRecompute = null; _placeCenter = null; // 대상 바뀌면 인터랙티브 배치 무효화
+            SetStepDone(2, false);
+            UpdateSurfaceButtonText();
             SetStatus("대상 표면 선택 해제됨");
             UpdateTargetOutlinePreview();
             // 천공 벽면이 대상 표면을 fallback 으로 쓰므로 그것도 함께 무효화 (선택된 게 없으니)
@@ -1364,6 +1691,7 @@ namespace Plugin01
             if (list.Count == 0) { SetStatus("선택된 폐곡선이 없습니다"); return; }
             _manualPunchCurves = list;
             _lblPunchCurves.Text = $"직접 선택: {list.Count}개 (사용)";
+            SetButtonActive(_btnPickPunchCurves, true);
             SetStatus($"천공 커브 {list.Count}개 직접 선택됨");
         }
 
@@ -1408,6 +1736,22 @@ namespace Plugin01
             return true;
         }
 
+        // 커터 미리보기(brep)가 떠 있는지에 따라 버튼 텍스트 갱신
+        private void UpdateCutterPreviewButtonText()
+        {
+            bool shown = _preview.Breps != null && _preview.Breps.Count > 0;
+            if (_btnCutterPreview != null) _btnCutterPreview.Text = shown ? "커터 미리보기 지우기" : "커터 미리보기 (Boolean 전)";
+            SetButtonActive(_btnCutterPreview, shown);
+        }
+
+        // 하나의 버튼으로 커터 미리보기/지우기 토글
+        private void OnToggleCutterPreview(object sender, EventArgs e)
+        {
+            bool shown = _preview.Breps != null && _preview.Breps.Count > 0;
+            if (shown) OnClearPreview(sender, e);
+            else OnPreviewCutters(sender, e);
+        }
+
         private void OnPreviewCutters(object sender, EventArgs e)
         {
             Brep targetBrep; List<Curve> punchCurves; List<int> punchFaces; double tol; bool wallOnly;
@@ -1432,6 +1776,7 @@ namespace Plugin01
             _preview.Curves = new List<Curve>();
             _preview.Breps = built.Cutters;
             _preview.Enabled = true;
+            UpdateCutterPreviewButtonText();
             RhinoDoc.ActiveDoc?.Views.Redraw();
             SetStatus($"커터 미리보기: {built.Cutters.Count}개 (폴백 {built.FallbackCount}, 실패 {built.FailedCount}, 벽없음 {built.NoWallCount}) — 시작 {safS:0.0}mm / 끝 {safE:0.0}mm / 구배 {draft:0.0}°");
         }
@@ -1472,6 +1817,7 @@ namespace Plugin01
             doc.Objects.Hide(_targetObjectId, true);
             doc.Views.Redraw();
 
+            SetStepDone(4, true);
             SetStatus($"천공 완료 [{res.Stage}]: 성공 {res.SuccessCount}/{res.CutterCount} (폴백 {res.FallbackCount}, 실패 {res.FailedCount}, 벽없음 {res.NoWallCount}) — 구배 {draft:0.0}°");
         }
     }

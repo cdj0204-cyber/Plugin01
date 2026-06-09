@@ -1483,6 +1483,59 @@ namespace Plugin01
         /// 표면 밖으로 투영되는 vertex 가 있는 커브는 제거(외곽선/구멍 클리핑). 미러/곡면 무관 균일.
         /// </summary>
         // boundaryMode/fadeRings/margin: RealSize 와 동일 개념의 경계 처리(단, 단일 stamp 라 거리 기반).
+        /// <summary>
+        /// PartialFit 전략1(평행투영)에서 반복 재계산(인터랙티브)에 재사용할 무거운 사전 계산 결과.
+        /// 면 mesh / 투영 프레임 / 경계 loop 은 패턴 위치·회전·크기와 무관하므로 한 번만 만들어 캐시한다.
+        /// </summary>
+        public class PartialProjContext
+        {
+            public bool Valid;
+            public PatternInfo Info;
+            public Vector3d AvgN, Ti, Tj;
+            public Point3d SeedSurf;
+            public double BboxDiag;
+            public Mesh ProjMesh;
+            public List<Curve> BLoops;     // 2D 경계 loop (없으면 null)
+            public List<Curve> ClipLoops;  // 인셋된 자르기 loop (없으면 BLoops)
+            public double ClipTol;
+            public double FadeDist;
+            public int BoundaryMode;
+            public double Margin;
+        }
+
+        /// <summary>무거운 사전 계산(면 mesh·프레임·경계 loop)을 한 번 수행. 인터랙티브 드래그 전에 호출해 캐시.</summary>
+        public static PartialProjContext BuildPartialProjContext(Brep brep, IList<int> faceIndices,
+                IList<Curve> patternCurves, Vector3d refDir,
+                int boundaryMode = 0, int fadeRings = 2, double margin = 0)
+        {
+            var ctx = new PartialProjContext { Valid = false, BoundaryMode = boundaryMode, Margin = margin };
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return ctx;
+            if (patternCurves == null || patternCurves.Count == 0) return ctx;
+            var info = PatternAnalyzer.Analyze(patternCurves);
+            if (!info.Valid) return ctx;
+            var faceSet = new HashSet<int>(faceIndices);
+
+            Vector3d avgN, Ti, Tj; Point3d seedSurf; BoundingBox sbb; double bboxDiag;
+            if (!ComputeProjectionFrame(brep, faceIndices, faceSet, refDir, out avgN, out Ti, out Tj, out seedSurf, out sbb, out bboxDiag))
+                return ctx;
+            var projMesh = BuildSelectedFacesMesh(brep, faceSet);
+            if (projMesh == null) return ctx;
+
+            double chord = Math.Max(info.CellW, info.CellH) / 20.0;
+            Point3d origin = seedSurf;
+            List<Curve> bLoops = (boundaryMode == 2 || (boundaryMode == 0 && margin > 1e-9))
+                ? BuildPlaneBoundaryLoops(brep, faceIndices, origin, Ti, Tj, chord) : null;
+            double clipTol = Math.Max(1e-4, Math.Min(info.CellW, info.CellH) * 0.01);
+            List<Curve> clipLoops = (boundaryMode == 2 && margin > 1e-9 && bLoops != null && bLoops.Count > 0)
+                ? InsetLoops(bLoops, margin, clipTol) : bLoops;
+            double fadeDist = Math.Max(1e-6, Math.Max(1, fadeRings) * Math.Min(info.PitchU, info.PitchV));
+
+            ctx.Info = info; ctx.AvgN = avgN; ctx.Ti = Ti; ctx.Tj = Tj; ctx.SeedSurf = seedSurf;
+            ctx.BboxDiag = bboxDiag; ctx.ProjMesh = projMesh; ctx.BLoops = bLoops; ctx.ClipLoops = clipLoops;
+            ctx.ClipTol = clipTol; ctx.FadeDist = fadeDist; ctx.Valid = true;
+            return ctx;
+        }
+
         public static List<Curve> TileConnectedPartial_Projection(Brep brep, IList<int> faceIndices,
                 IList<Curve> patternCurves, BoundingBox patternBox,
                 Vector3d refDir, double angleTolRad,
@@ -1490,19 +1543,30 @@ namespace Plugin01
                 double scale = 1.0, Point3d? patternCenterOverride = null,
                 int boundaryMode = 0, int fadeRings = 2, double margin = 0)
         {
-            var result = new List<Curve>();
-            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
-            if (patternCurves == null || patternCurves.Count == 0) return result;
-            var info = PatternAnalyzer.Analyze(patternCurves);
-            if (!info.Valid) return result;
-            var faceSet = new HashSet<int>(faceIndices);
+            var ctx = BuildPartialProjContext(brep, faceIndices, patternCurves, refDir, boundaryMode, fadeRings, margin);
+            if (!ctx.Valid) return new List<Curve>();
+            return TilePartialProjectionFromContext(ctx, patternCurves, patternBox,
+                uOffsetMm, vOffsetMm, rotationDeg, scale, patternCenterOverride);
+        }
 
-            Vector3d avgN, Ti, Tj; Point3d seedSurf; BoundingBox sbb; double bboxDiag;
-            if (!ComputeProjectionFrame(brep, faceIndices, faceSet, refDir, out avgN, out Ti, out Tj, out seedSurf, out sbb, out bboxDiag))
-                return result;
-            var projMesh = BuildSelectedFacesMesh(brep, faceSet);
-            if (projMesh == null) return result;
-            double rayLen = Math.Max(bboxDiag * 2.0, 1.0);
+        /// <summary>캐시된 컨텍스트로 패턴 한 묶음을 배치/투영 (가벼운 per-frame 부분). 인터랙티브 드래그에서 매 프레임 호출.</summary>
+        public static List<Curve> TilePartialProjectionFromContext(PartialProjContext ctx,
+                IList<Curve> patternCurves, BoundingBox patternBox,
+                double uOffsetMm, double vOffsetMm, double rotationDeg,
+                double scale = 1.0, Point3d? patternCenterOverride = null)
+        {
+            var result = new List<Curve>();
+            if (ctx == null || !ctx.Valid || patternCurves == null || patternCurves.Count == 0) return result;
+
+            var info = ctx.Info;
+            Vector3d avgN = ctx.AvgN, Ti = ctx.Ti, Tj = ctx.Tj;
+            Point3d seedSurf = ctx.SeedSurf;
+            Mesh projMesh = ctx.ProjMesh;
+            int boundaryMode = ctx.BoundaryMode;
+            double margin = ctx.Margin;
+            List<Curve> bLoops = ctx.BLoops, clipLoops = ctx.ClipLoops;
+            double clipTol = ctx.ClipTol, fadeDist = ctx.FadeDist;
+            double rayLen = Math.Max(ctx.BboxDiag * 2.0, 1.0);
 
             // 패턴 중심 (평면 위). override 면 그 점, 아니면 seed + (U,V) offset.
             Point3d planeCenter = patternCenterOverride.HasValue
@@ -1516,14 +1580,6 @@ namespace Plugin01
             double chord = Math.Max(info.CellW, info.CellH) / 20.0;
             Point3d origin = seedSurf; // To2D 기준 평면 원점
 
-            // 경계 처리용 loop(2D): 삭제+마진 또는 자르기일 때만 초록 경계 사용.
-            // (축소 모드는 초록 경계가 아니라 "패턴이 끝나는 지점"=패턴 bbox 가장자리를 기준으로 함)
-            List<Curve> bLoops = (boundaryMode == 2 || (boundaryMode == 0 && margin > 1e-9))
-                ? BuildPlaneBoundaryLoops(brep, faceIndices, origin, Ti, Tj, chord) : null;
-            double clipTol = Math.Max(1e-4, Math.Min(info.CellW, info.CellH) * 0.01);
-            List<Curve> clipLoops = (boundaryMode == 2 && margin > 1e-9 && bLoops != null && bLoops.Count > 0)
-                ? InsetLoops(bLoops, margin, clipTol) : bLoops;
-            double fadeDist = Math.Max(1e-6, Math.Max(1, fadeRings) * Math.Min(info.PitchU, info.PitchV));
             // 축소 기준 = 패턴 bbox 가장자리 (패턴 공간)
             double pbMinX = patternBox.Min.X, pbMaxX = patternBox.Max.X;
             double pbMinY = patternBox.Min.Y, pbMaxY = patternBox.Max.Y;
