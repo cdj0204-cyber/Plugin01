@@ -289,6 +289,7 @@ namespace Plugin01
             // RealSize 전용 알고리즘(전략) 선택 — 대상 표면에 따라 골라 타일링 성공률을 높임
             _ddStrategy.Items.Add("Strategy 1: Surface walk (curved/continuous)");
             _ddStrategy.Items.Add("Strategy 2: Planar grid projection (multi-face/flat)");
+            _ddStrategy.Items.Add("Strategy 3: Surface UV march (steep/wrapped surfaces)");
             _ddStrategy.SelectedIndex = 0;
 
             _rowCounts = new StackLayout
@@ -1203,12 +1204,18 @@ namespace Plugin01
                         all.AddRange(SurfaceTiler.TileConnectedRealSizeFit_StrategyTwo(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDeg.Value));
                         all = ApplyMarginFilter(all); // 전략2 는 종전대로 후처리 마진 필터
                     }
+                    else if (strat == 2)
+                    {
+                        // 전략3: 면별 UV 격자 + 실측 격자 재추정 (가파른 벽/곡면). 경계는 후처리 마진 필터로 처리
+                        all.AddRange(SurfaceTiler.TileConnectedRealSizeFit_StrategyThree(_targetBrep, _faceIndices, info, pattern, refDirR, angleTolR, _rotDeg.Value));
+                        all = ApplyMarginFilter(all);
+                    }
                     else
                     {
                         // 전략1: 경계 처리 모드 + margin(경계 인셋)을 타일러 내부에서 처리 → ApplyMarginFilter 미적용
                         all.AddRange(SurfaceTiler.TileConnectedRealSizeFit(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDeg.Value, _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginR));
                     }
-                    string stratName = (strat == 1) ? "Strategy 2 (planar grid)" : "Strategy 1 (surface walk)";
+                    string stratName = (strat == 1) ? "Strategy 2 (planar grid)" : (strat == 2) ? "Strategy 3 (UV march)" : "Strategy 1 (surface walk)";
                     SetStatus($"Analysis [{stratName}]: cell {info.CellW:0.#}x{info.CellH:0.#}, rotation {_rotDeg.Value:0.#}° → {all.Count} cells{orInfo}");
                     return all;
                 }

@@ -2383,6 +2383,399 @@ namespace Plugin01
             return result;
         }
 
+        /// <summary>패턴 곡선들에서 실제 격자를 재추정: 행별 가로 피치(Pu), 행 간격(Pv),
+        /// 인접 행 간 가로 위상 증분(deltaPhase, 벽돌식이면 ≈Pu/2). repCell=대표 셀.</summary>
+        private static void AnalyzePatternLattice(IList<Curve> curves, double cellH,
+                out double Pu, out double Pv, out double deltaPhase, out Curve repCell)
+        {
+            Pu = 0; Pv = 0; deltaPhase = 0; repCell = null;
+            if (curves == null || curves.Count == 0) return;
+            var cen = new List<double[]>();
+            foreach (var c in curves) { var b = c.GetBoundingBox(true); cen.Add(new[] { b.Center.X, b.Center.Y }); }
+            cen.Sort((a, b) => a[1].CompareTo(b[1]));
+            double yTol = Math.Max(1e-6, cellH * 0.6);
+            var rows = new List<List<double>>();
+            var rowY = new List<double>();
+            double lastY = double.NaN;
+            foreach (var p in cen)
+            {
+                if (rows.Count == 0 || p[1] - lastY > yTol) { rows.Add(new List<double>()); rowY.Add(p[1]); }
+                rows[rows.Count - 1].Add(p[0]);
+                lastY = p[1];
+            }
+            var vd = new List<double>();
+            for (int i = 1; i < rowY.Count; i++) vd.Add(rowY[i] - rowY[i - 1]);
+            Pv = Median(vd);
+            var ud = new List<double>();
+            foreach (var r in rows) { r.Sort(); for (int i = 1; i < r.Count; i++) ud.Add(r[i] - r[i - 1]); }
+            Pu = Median(ud);
+            if (Pu > 1e-9)
+            {
+                var pd = new List<double>();
+                for (int i = 1; i < rows.Count; i++)
+                {
+                    if (rows[i].Count == 0 || rows[i - 1].Count == 0) continue;
+                    double d = rows[i][0] - rows[i - 1][0];
+                    pd.Add(d - Pu * Math.Round(d / Pu)); // [-Pu/2, Pu/2]
+                }
+                deltaPhase = Median(pd);
+            }
+            // 대표 셀: 전체 중심에 가장 가까운 곡선을 원점 정렬
+            double cx = 0, cy = 0; foreach (var p in cen) { cx += p[0]; cy += p[1]; }
+            cx /= cen.Count; cy /= cen.Count;
+            int best = 0; double bestD = double.MaxValue;
+            for (int i = 0; i < curves.Count; i++)
+            {
+                var b = curves[i].GetBoundingBox(true);
+                double d = (b.Center.X - cx) * (b.Center.X - cx) + (b.Center.Y - cy) * (b.Center.Y - cy);
+                if (d < bestD) { bestD = d; best = i; }
+            }
+            repCell = curves[best].DuplicateCurve();
+            var rb = repCell.GetBoundingBox(true);
+            repCell.Translate(-rb.Center.X, -rb.Center.Y, -rb.Center.Z);
+        }
+
+        private static double Median(List<double> v)
+        {
+            if (v == null || v.Count == 0) return 0;
+            v.Sort();
+            return v[v.Count / 2];
+        }
+
+        /// <summary>
+        /// Strategy 3 (면별 UV 격자 + 실측 격자 재추정): 패턴의 실제 가로 피치/행 간격/벽돌 엇갈림을
+        /// 재계산해, 각 면의 UV 공간에 그 간격으로 셀(대표 도형)을 배치한다. 평면 투영이 겹치는 곡면에서도
+        /// 표면을 따라가며 셀 간격·연속성·엇갈림을 그대로 재현. 셀은 원본 곡선 강체 변환(끝단 매끈).
+        /// </summary>
+        public static List<Curve> TileConnectedRealSizeFit_StrategyThree(Brep brep, IList<int> faceIndices,
+                PatternInfo info, IList<Curve> patternCurves, Vector3d refDir, double angleTolRad, double rotationDeg = 0)
+        {
+            var result = new List<Curve>();
+            if (brep == null || faceIndices == null || faceIndices.Count == 0) return result;
+            if (info == null || !info.Valid || info.UnitCells.Count == 0) return result;
+
+            // 실제 격자 재추정 (브릭 엇갈림 → PatternAnalyzer 가 가로 피치를 절반으로 보는 문제 보정)
+            double Pu, Pv, deltaPhase; Curve repCell;
+            AnalyzePatternLattice(patternCurves, info.CellH, out Pu, out Pv, out deltaPhase, out repCell);
+            if (Pu <= 1e-6) Pu = Math.Max(1e-6, info.PitchU);
+            if (Pv <= 1e-6) Pv = Math.Max(1e-6, info.PitchV);
+            if (repCell == null) repCell = info.UnitCells[0];
+
+            double rotRad = rotationDeg * Math.PI / 180.0;
+            double cosR = Math.Cos(rotRad), sinR = Math.Sin(rotRad);
+
+            // 셀을 표면에 안착시키기 위해 곡선을 미세 샘플(원점 정렬됨) → 정점마다 UV 오프셋으로 표면점 계산
+            double chord = Math.Max(0.2, Math.Min(info.CellW, info.CellH) / 12.0);
+            var repPts = SampleCurve(repCell, chord);
+
+            double dedupDist = Math.Min(Pu, Pv) * 0.4;
+            var occ = new Dictionary<long, List<Point3d>>();
+
+            // 선택 면 전체를 하나의 sub-brep 으로 합쳐 면 경계를 무시하고 연속 타일링.
+            // 시드 링(중간 높이 단면)에서 출발해, 각 셀을 표면을 따라 Pv 만큼 올려/내려(균일 세로간격)
+            // 다음 링 곡선을 만들고, 그 곡선을 Pu 간격(+브릭 위상)으로 재샘플 → 셀 수가 둘레에 맞춰 자동 증감.
+            var sub = brep.DuplicateSubBrep(faceIndices);
+            if (sub == null) return result;
+            var sbb = sub.GetBoundingBox(true);
+            double secTol = Math.Max(1e-4, Math.Min(Pu, Pv) * 0.02);
+            double axX = 0.5 * (sbb.Min.X + sbb.Max.X);
+            double axY = 0.5 * (sbb.Min.Y + sbb.Max.Y);
+            double bigR = sbb.Diagonal.Length + 10.0;
+            double z0 = sbb.Min.Z, z1 = sbb.Max.Z;
+
+            // 점 → sub 표면 투영(면/uv/도함수/법선)
+            bool Reproject(Point3d pt, out Point3d P, out BrepFace face, out double u, out double v, out Vector3d du, out Vector3d dv, out Vector3d N)
+            {
+                P = pt; face = null; u = 0; v = 0; du = Vector3d.Zero; dv = Vector3d.Zero; N = Vector3d.ZAxis;
+                Point3d cp; ComponentIndex ci; double s, t; Vector3d nrm;
+                if (!sub.ClosestPoint(pt, out cp, out ci, out s, out t, 0.0, out nrm)) return false;
+                int fidx = (ci.ComponentIndexType == ComponentIndexType.BrepFace) ? ci.Index : -1;
+                if (fidx < 0)
+                {
+                    double best = double.MaxValue;
+                    for (int i = 0; i < sub.Faces.Count; i++)
+                    {
+                        double uu, vv;
+                        if (!((Surface)sub.Faces[i]).ClosestPoint(cp, out uu, out vv)) continue;
+                        double d = ((Surface)sub.Faces[i]).PointAt(uu, vv).DistanceTo(cp);
+                        if (d < best) { best = d; fidx = i; }
+                    }
+                    if (fidx < 0) return false;
+                }
+                face = sub.Faces[fidx];
+                if (!((Surface)face).ClosestPoint(cp, out u, out v)) return false;
+                Point3d pp;
+                if (!EvalDeriv(face, u, v, out pp, out du, out dv)) return false;
+                if (du.Length < 1e-9 || dv.Length < 1e-9) return false;
+                N = Vector3d.CrossProduct(du, dv); if (N.Length < 1e-9) return false; N.Unitize();
+                if (face.OrientationIsReversed) N = -N;
+                P = pp; return true;
+            }
+
+            // 한 점에 셀 배치(around = 링 진행방향). 정점은 UV 오프셋으로 표면에 안착.
+            void PlaceCell(Point3d P, BrepFace face, double u, double v, Vector3d du, Vector3d dv, Vector3d N, Vector3d around)
+            {
+                double a = du * du, b = du * dv, cc = dv * dv, det = a * cc - b * b;
+                if (Math.Abs(det) < 1e-12) return;
+                Vector3d ar = around - (around * N) * N; if (ar.Length < 1e-9) return; ar.Unitize();
+                Vector3d up = Vector3d.CrossProduct(N, ar); if (up.Length < 1e-9) return; up.Unitize();
+                if (up * Vector3d.ZAxis < 0) up = -up;
+                Vector3d Xr = cosR * ar + sinR * up;
+                Vector3d Yr = -sinR * ar + cosR * up;
+                if (!DedupTryAdd(occ, P, dedupDist)) return;
+                var mapped = new Point3d[repPts.Length];
+                for (int k = 0; k < repPts.Length; k++)
+                {
+                    Vector3d off = repPts[k].X * Xr + repPts[k].Y * Yr;
+                    double e = du * off, f = dv * off;
+                    double delU = (e * cc - f * b) / det;
+                    double delV = (a * f - b * e) / det;
+                    mapped[k] = ((Surface)face).PointAt(u + delU, v + delV);
+                }
+                var crv = new PolylineCurve(mapped);
+                if (crv.IsValid) result.Add(crv);
+            }
+
+            // 수평 단면(Z=const)으로 면 경계를 가로지르는 연속 링.
+            // 핵심: 각 링의 셀을 "바로 아래 행 셀들의 중간점"에 둠 → 모든 각도에서 정확히 반 셀 엇갈림(브릭).
+            //       (절대 +X 기준이 아니라 아래 행 기준이라, 둘레/셀수가 달라도 양쪽 면이 동일하게 브릭이 됨)
+            // 간격이 Pu 미만이 될 곳은 셀 제거, 너무 벌어질 곳은 셀 삽입(국소) → 겹침 없음, 아래로 갈수록 자동 증가.
+
+            // 지정 높이의 단면(가장 긴 닫힌 곡선, 반시계 정규화)
+            Func<double, Curve> SectionAt = (zz) =>
+            {
+                Curve[] ss; Point3d[] pp;
+                if (!Rhino.Geometry.Intersect.Intersection.BrepPlane(sub, new Plane(new Point3d(0, 0, zz), Vector3d.ZAxis), secTol, out ss, out pp) || ss == null) return null;
+                Curve best = null; double bl = 0;
+                foreach (var c in ss) if (c != null && c.IsClosed) { double l = c.GetLength(); if (l > bl) { bl = l; best = c; } }
+                if (best != null && best.ClosedCurveOrientation(Vector3d.ZAxis) == CurveOrientation.Clockwise) best.Reverse();
+                return best;
+            };
+
+            // 곡선 C 의 호 위치 목록에 셀 배치 + 그 3D 점들 반환
+            Func<Curve, List<double>, List<Point3d>> PlaceArcs = (C, arcsIn) =>
+            {
+                var ptsOut = new List<Point3d>();
+                double L = C.GetLength();
+                foreach (double aRaw in arcsIn)
+                {
+                    double a = ((aRaw % L) + L) % L;
+                    double tp; if (!C.LengthParameter(a, out tp)) continue;
+                    Point3d raw = C.PointAt(tp); Vector3d tan = C.TangentAt(tp);
+                    Point3d P; BrepFace f; double u, v; Vector3d du, dv, N;
+                    if (!Reproject(raw, out P, out f, out u, out v, out du, out dv, out N)) continue;
+                    ptsOut.Add(P);
+                    PlaceCell(P, f, u, v, du, dv, N, tan);
+                }
+                return ptsOut;
+            };
+
+            // 셀 수를 nDes 로 맞춤: 좁은 간격 셀 제거 / 넓은 간격에 셀 삽입(브릭은 대부분 유지, 변경은 국소)
+            Action<List<double>, double, int> AdjustCount = (a, L, nDes) =>
+            {
+                while (a.Count > nDes && a.Count > 1)
+                {
+                    int c = a.Count, rem = 0; double best = double.MaxValue;
+                    for (int i = 0; i < c; i++) { double g = (i + 1 < c ? a[i + 1] : a[0] + L) - a[i]; if (g < best) { best = g; rem = (i + 1) % c; } }
+                    a.RemoveAt(rem);
+                }
+                while (a.Count < nDes && a.Count >= 1)
+                {
+                    int c = a.Count, ins = 0; double best = -1, pos = 0;
+                    for (int i = 0; i < c; i++) { double aa = a[i], bb = (i + 1 < c ? a[i + 1] : a[0] + L); double g = bb - aa; if (g > best) { best = g; ins = i; pos = ((aa + bb) / 2) % L; } }
+                    a.Insert(ins + 1, pos);
+                }
+                a.Sort();
+            };
+
+            // 이전 행(prevPts) 기준으로 C 위에 브릭(중간점) 셀 호 위치 생성
+            Func<Curve, List<Point3d>, List<double>> BrickArcs = (C, prevPts) =>
+            {
+                double L = C.GetLength();
+                int nMax = Math.Max(1, (int)Math.Floor(L / Pu));          // 간격 ≥ Pu (겹침 금지)
+                int nMin = Math.Max(1, (int)Math.Ceiling(L / (Pu * 1.6))); // 간격 ≤ 1.6Pu (아래로 약간 넓어짐 허용 → 코너 삽입 빈도↓)
+                if (nMax < nMin) nMax = nMin;
+                var arcs = new List<double>();
+                foreach (var p in prevPts) { double t; if (C.ClosestPoint(p, out t)) arcs.Add(C.GetLength(new Interval(C.Domain.T0, t))); }
+                if (arcs.Count < 2)
+                {
+                    var fa = new List<double>(); int nf = Math.Min(nMax, Math.Max(nMin, nMax));
+                    for (int k = 0; k < nf; k++) fa.Add(k * L / nf);
+                    return fa;
+                }
+                arcs.Sort();
+                int m = arcs.Count;
+                var mids = new List<double>();
+                for (int i = 0; i < m; i++) { double aa = arcs[i]; double bb = (i + 1 < m) ? arcs[i + 1] : arcs[0] + L; mids.Add(((aa + bb) / 2) % L); }
+                mids.Sort();
+                int nDes = Math.Min(nMax, Math.Max(nMin, m)); // 현재 셀 수를 최대한 유지(브릭 연속), 간격 한도 내에서
+                // 삽입(넓어지는 방향)은 링당 1개로 제한 → 코너에서 한 줄에 셀이 우르르 추가/병합되며
+                // 엇갈림이 깨지던 현상 방지(국소 분산, 양 코너가 번갈아 한 칸씩 증가).
+                // 제거(좁아지는 방향)는 제한하지 않음 → 간격 ≥ Pu(겹침 금지) 유지가 우선.
+                if (nDes > m + 1) nDes = m + 1;
+                AdjustCount(mids, L, nDes);
+                return mids;
+            };
+
+            // 시드 링 = 둘레가 '가장 좁은' 단면. 거기서 양방향으로 멀어질수록 면적이 넓어지므로
+            // 브릭 진행이 '셀 삽입'만 발생(아래 BrickArcs 에서 링당 1개로 분산) → 코너에서 셀이 한꺼번에
+            // 합쳐지며(제거) 엇갈림이 깨지던 문제를 원천 제거. (퍼널 형상은 시드가 자연히 최상단 근처)
+            double zSeed = 0.5 * (z0 + z1); Curve seedC = null; double minLen = double.MaxValue;
+            for (int i = 1; i < 28; i++)
+            {
+                double zz = z0 + (z1 - z0) * (i / 28.0);
+                var c = SectionAt(zz);
+                if (c == null) continue;
+                double l = c.GetLength();
+                if (l < Pu * 2.0) continue;
+                if (l < minLen) { minLen = l; seedC = c; zSeed = zz; }
+            }
+            if (seedC == null) return result;
+            double seedL = seedC.GetLength();
+            int n0 = Math.Max(1, (int)Math.Floor(seedL / Pu));
+            { int nm = Math.Max(1, (int)Math.Ceiling(seedL / (Pu * 1.6))); if (n0 < nm) n0 = nm; }
+            var seedArcs = new List<double>(); for (int k = 0; k < n0; k++) seedArcs.Add(k * seedL / n0);
+            var prevRing = PlaceArcs(seedC, seedArcs);
+
+            // ΔZ(경사) 추정: 한 점에서 측정
+            Func<Curve, double> SlopeOf = (C) =>
+            {
+                double tp; C.LengthParameter(0.0, out tp);
+                Point3d rp = C.PointAt(tp); Vector3d rt = C.TangentAt(tp);
+                Point3d rP; BrepFace rf; double ru, rv; Vector3d rdu, rdv, rN;
+                if (!Reproject(rp, out rP, out rf, out ru, out rv, out rdu, out rdv, out rN)) return 1.0;
+                Vector3d arrR = rt - (rt * rN) * rN; if (arrR.Length < 1e-9) return 1.0; arrR.Unitize();
+                Vector3d upR = Vector3d.CrossProduct(rN, arrR); if (upR.Length < 1e-9) return 1.0; upR.Unitize();
+                return Math.Max(0.2, Math.Abs(upR * Vector3d.ZAxis));
+            };
+
+            // 위로
+            double zc = zSeed; var cur = prevRing; var curC = seedC; int g2 = 0;
+            while (g2++ < 4000)
+            {
+                zc += Pv * SlopeOf(curC);
+                if (zc >= z1) break;
+                Curve C = SectionAt(zc); if (C == null) break;
+                var arcs = BrickArcs(C, cur); var nr = PlaceArcs(C, arcs);
+                if (nr.Count < 2) break; cur = nr; curC = C;
+            }
+            // 아래로
+            zc = zSeed; cur = prevRing; curC = seedC; g2 = 0;
+            while (g2++ < 4000)
+            {
+                zc -= Pv * SlopeOf(curC);
+                if (zc <= z0) break;
+                Curve C = SectionAt(zc); if (C == null) break;
+                var arcs = BrickArcs(C, cur); var nr = PlaceArcs(C, arcs);
+                if (nr.Count < 2) break; cur = nr; curC = C;
+            }
+            return result;
+        }
+
+        /// <summary>v 고정 행을 따라 uMin→uMax 의 world 호 길이(약 120 분할 적분).</summary>
+        private static double RingArcLength(BrepFace face, double v, double uMin, double uMax)
+        {
+            int seg = 120;
+            double du = (uMax - uMin) / seg;
+            double len = 0;
+            Point3d prev; Vector3d a, b;
+            if (!EvalDeriv(face, uMin, v, out prev, out a, out b)) return 0;
+            for (int i = 1; i <= seg; i++)
+            {
+                Point3d cur; Vector3d a2, b2;
+                if (!EvalDeriv(face, uMin + i * du, v, out cur, out a2, out b2)) { prev = cur; continue; }
+                len += cur.DistanceTo(prev);
+                prev = cur;
+            }
+            return len;
+        }
+
+        /// <summary>v 고정 행에서 현재 u 로부터 world 호 길이 arc 만큼 전진한 u 반환(닫힌 면이면 주기 wrap).</summary>
+        private static double AdvanceU(BrepFace face, double v, double u, double arc, double uMin, double uMax, bool wrap)
+        {
+            double remaining = arc; int g = 0;
+            double maxStep = Math.Max(1e-9, (uMax - uMin) / 60.0);
+            while (remaining > 1e-9 && g++ < 2000)
+            {
+                double sp = SurfaceSpeed(face, true, v, u);
+                if (sp < 1e-9) break;
+                double step = remaining / sp;
+                if (step > maxStep) step = maxStep;
+                u += step;
+                remaining -= step * sp;
+                if (u > uMax) { if (wrap) u = uMin + (u - uMax); else { u = uMax; break; } }
+            }
+            return u;
+        }
+
+        /// <summary>한 파라미터를 start 에서 양방향으로, 매 스텝 국부 호 길이가 pitch 가 되도록 적응 행진.</summary>
+        private static List<double> MarchAdaptive(BrepFace face, bool marchU, double fixedC,
+                                                  double start, double pMin, double pMax, double pitch)
+        {
+            var list = new List<double>();
+            if (start >= pMin - 1e-9 && start <= pMax + 1e-9)
+                list.Add(Math.Min(pMax, Math.Max(pMin, start)));
+            double p = start; int g = 0;
+            while (g++ < 5000)
+            {
+                double sp = SurfaceSpeed(face, marchU, fixedC, p);
+                if (sp < 1e-9) break;
+                p += pitch / sp;
+                if (p > pMax + 1e-9) break;
+                list.Add(p);
+            }
+            p = start; g = 0;
+            while (g++ < 5000)
+            {
+                double sp = SurfaceSpeed(face, marchU, fixedC, p);
+                if (sp < 1e-9) break;
+                p -= pitch / sp;
+                if (p < pMin - 1e-9) break;
+                list.Add(p);
+            }
+            list.Sort();
+            return list;
+        }
+
+        /// <summary>(marchU?u:v)=p, 나머지=fixedC 지점에서 그 방향 편도함수 길이(=단위 파라미터당 world 거리).</summary>
+        private static double SurfaceSpeed(BrepFace face, bool marchU, double fixedC, double p)
+        {
+            double u = marchU ? p : fixedC;
+            double v = marchU ? fixedC : p;
+            Point3d pt; Vector3d du, dv;
+            if (!EvalDeriv(face, u, v, out pt, out du, out dv)) return 0;
+            return marchU ? du.Length : dv.Length;
+        }
+
+        /// <summary>공간 해시 거리 기반 중복 제거: p 가 기존 점과 dist 미만이면 false(중복), 아니면 등록 후 true.</summary>
+        private static bool DedupTryAdd(Dictionary<long, List<Point3d>> occ, Point3d p, double dist)
+        {
+            if (dist < 1e-9) dist = 1e-9;
+            long bx = (long)Math.Floor(p.X / dist);
+            long by = (long)Math.Floor(p.Y / dist);
+            long bz = (long)Math.Floor(p.Z / dist);
+            double d2 = dist * dist;
+            for (int ax = -1; ax <= 1; ax++)
+                for (int ay = -1; ay <= 1; ay++)
+                    for (int az = -1; az <= 1; az++)
+                    {
+                        List<Point3d> lst;
+                        if (occ.TryGetValue(BucketKey(bx + ax, by + ay, bz + az), out lst))
+                            foreach (var q in lst)
+                                if ((q - p).SquareLength < d2) return false;
+                    }
+            long key = BucketKey(bx, by, bz);
+            List<Point3d> cell;
+            if (!occ.TryGetValue(key, out cell)) { cell = new List<Point3d>(); occ[key] = cell; }
+            cell.Add(p);
+            return true;
+        }
+
+        private static long BucketKey(long x, long y, long z)
+        {
+            unchecked { return (x * 73856093L) ^ (y * 19349663L) ^ (z * 83492791L); }
+        }
+
         /// <summary>
         /// "실제 크기 - 패턴 부분적용": 패턴 N개를 실제 크기로 표면 위에 한 묶음 올리고
         /// 사용자가 U/V 오프셋(mm)과 회전(도)으로 위치를 자유롭게 잡는다.
