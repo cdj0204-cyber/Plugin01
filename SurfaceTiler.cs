@@ -415,6 +415,36 @@ namespace Plugin01
             return gaps[gaps.Count / 2]; // 중앙값
         }
 
+        /// <summary>닫힌 커브가 꺾임(G1 불연속) 없이 매끈하게 이어지는지 — 닫힘 이음매 포함.</summary>
+        private static bool IsCurveSmoothClosed(Curve c)
+        {
+            if (c == null || !c.IsClosed) return false;
+            double t0 = c.Domain.T0, t1 = c.Domain.T1, t;
+            // 내부에 G1 불연속(꺾임)이 하나라도 있으면 매끈하지 않음(직각 사각형 등 모서리 보존)
+            if (c.GetNextDiscontinuity(Continuity.G1_continuous, t0, t1, out t)) return false;
+            // 닫힘 이음매(시작=끝)의 접선 일치 확인
+            Vector3d ts = c.TangentAtStart, te = c.TangentAtEnd;
+            if (ts.IsValid && te.IsValid && Vector3d.VectorAngle(ts, te) > 0.0873) return false; // > ~5°
+            return true;
+        }
+
+        /// <summary>표면에 매핑된 점들을 3차 주기 보간 곡선으로 복원(닫힘 중복점 제거). 실패 시 null.</summary>
+        private static Curve BuildSmoothClosed(Point3d[] mapped)
+        {
+            if (mapped == null || mapped.Length < 4) return null;
+            var pts = new List<Point3d>(mapped.Length);
+            pts.AddRange(mapped);
+            // 닫힘용으로 중복된 끝점은 주기 보간에서 제거
+            if (pts.Count > 1 && pts[0].DistanceTo(pts[pts.Count - 1]) < 1e-9) pts.RemoveAt(pts.Count - 1);
+            if (pts.Count < 4) return null;
+            try
+            {
+                var c = Curve.CreateInterpolatedCurve(pts, 3, CurveKnotStyle.ChordPeriodic);
+                return (c != null && c.IsValid && c.IsClosed) ? c : null;
+            }
+            catch { return null; }
+        }
+
         private static Point3d[] SampleCurve(Curve c, double chord)
         {
             // 폴리라인이면 각 변을 chord로 분할하되 꼭짓점은 정확히 유지 (찌그러짐 방지)
@@ -2467,6 +2497,8 @@ namespace Plugin01
             // 셀을 표면에 안착시키기 위해 곡선을 미세 샘플(원점 정렬됨) → 정점마다 UV 오프셋으로 표면점 계산
             double chord = Math.Max(0.2, Math.Min(info.CellW, info.CellH) / 12.0);
             var repPts = SampleCurve(repCell, chord);
+            // 원본 셀이 매끈(tangent 연속)하면 표면 위 셀도 보간 곡선으로 → 두께면(로프트 옆면)이 분절되지 않게.
+            bool repSmooth = IsCurveSmoothClosed(repCell);
 
             double dedupDist = Math.Min(Pu, Pv) * 0.4;
             var occ = new Dictionary<long, List<Point3d>>();
@@ -2532,7 +2564,8 @@ namespace Plugin01
                     double delV = (a * f - b * e) / det;
                     mapped[k] = ((Surface)face).PointAt(u + delU, v + delV);
                 }
-                var crv = new PolylineCurve(mapped);
+                Curve crv = repSmooth ? BuildSmoothClosed(mapped) : null;
+                if (crv == null || !crv.IsValid) crv = new PolylineCurve(mapped);
                 if (crv.IsValid) result.Add(crv);
             }
 

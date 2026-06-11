@@ -441,6 +441,8 @@ namespace Plugin01
             _aziDeg.ValueChanged += OnAngleChanged;
             _btnPickPunchCurves = new Button { Text = "Pick Punch Curves (optional)" };
             _btnPickPunchCurves.Click += OnPickPunchCurves;
+            var btnPickDir = new Button { Text = "Set Punch Direction" };
+            btnPickDir.Click += OnPickDirection;
             _btnPunchFaces = new Button { Text = "Select Punch Walls" };
             _btnPunchFaces.Click += OnTogglePunchFaces;
             var rowDraft = new StackLayout
@@ -510,7 +512,7 @@ namespace Plugin01
                 Content = StepBody(
                     _wallOnly, _punchAutoConnect,
                     _btnPunchFaces, _lblPunchFaces,
-                    _btnPickPunchCurves, _lblPunchCurves, rowDraft, rowSafety,
+                    _btnPickPunchCurves, _lblPunchCurves, btnPickDir, _lblPunchDir, rowDraft, rowSafety,
                     _btnCutterPreview, btnPunch)
             };
 
@@ -1718,6 +1720,28 @@ namespace Plugin01
             _punchDir = sumN;
             SyncAnglesFromDir();
             UpdateDirLabel();
+        }
+
+        // 뷰포트에서 두 점을 찍어 관통 방향을 직접 지정 (러버밴드 라인 표시).
+        private void OnPickDirection(object sender, EventArgs e)
+        {
+            var gp1 = new Rhino.Input.Custom.GetPoint();
+            gp1.SetCommandPrompt("Punch direction: start point");
+            if (gp1.Get() != GetResult.Point) { SetStatus("Direction pick cancelled."); return; }
+            Point3d p1 = gp1.Point();
+
+            var gp2 = new Rhino.Input.Custom.GetPoint();
+            gp2.SetCommandPrompt("Punch direction: end point");
+            gp2.DrawLineFromPoint(p1, true);
+            if (gp2.Get() != GetResult.Point) { SetStatus("Direction pick cancelled."); return; }
+            Point3d p2 = gp2.Point();
+
+            var v = p2 - p1;
+            if (!v.Unitize()) { SetStatus("Direction length is zero."); return; }
+            _punchDir = v;
+            SyncAnglesFromDir();
+            UpdateDirLabel();
+            SetStatus("Punch direction set.");
         }
 
         private void UpdateDirLabel()
