@@ -445,6 +445,85 @@ namespace Plugin01
             catch { return null; }
         }
 
+        /// <summary>
+        /// 표면에 매핑된 점들을 매끈한 닫힌 곡선으로 복원하되, 회전각이 cornerDeg 를 넘는
+        /// '진짜 코너'만 꺾임(G0)으로 보존한다. 둥근 캡처럼 작은 각도가 이어지는 부분은 매끄럽게 보간.
+        /// (폴리라인 그대로 익스트루드하면 두께면에 폴리곤 심이 생기는 문제 해결)
+        /// </summary>
+        private static Curve BuildSmoothClosedPreservingCorners(Point3d[] mapped, double cornerDeg)
+        {
+            if (mapped == null || mapped.Length < 4) return null;
+
+            // 1) 인접 중복/근접점 제거 — CreateInterpolatedCurve 는 중복점이 있으면 실패(null)해서
+            //    폴리라인 폴백으로 떨어지고 두께면이 분절된다. 이를 먼저 방지.
+            double merge = 1e-3;
+            var pts = new List<Point3d>();
+            foreach (var p in mapped)
+                if (pts.Count == 0 || pts[pts.Count - 1].DistanceTo(p) > merge) pts.Add(p);
+            if (pts.Count > 1 && pts[0].DistanceTo(pts[pts.Count - 1]) < merge) pts.RemoveAt(pts.Count - 1);
+            int n = pts.Count;
+            if (n < 4) return null;
+
+            double cornerCos = Math.Cos(cornerDeg * Math.PI / 180.0);
+            var corners = new List<int>();
+            for (int i = 0; i < n; i++)
+            {
+                Vector3d a = pts[i] - pts[(i - 1 + n) % n];
+                Vector3d b = pts[(i + 1) % n] - pts[i];
+                if (a.Unitize() && b.Unitize() && (a * b) < cornerCos) corners.Add(i); // 회전각 > cornerDeg → 코너
+            }
+
+            // 코너 없음 → 통째로 매끈한 닫힌 곡선
+            if (corners.Count == 0)
+                return InterpClosed(pts);
+
+            // 코너로 분할 → 각 구간을 열린 보간(코너 끝점은 G0 유지) → PolyCurve 로 결합
+            var poly = new PolyCurve();
+            int m = corners.Count;
+            for (int k = 0; k < m; k++)
+            {
+                int start = corners[k];
+                int end = corners[(k + 1) % m];
+                var span = new List<Point3d> { pts[start] };
+                int idx = start;
+                int guard = 0;
+                while (idx != end && guard++ < n + 1) { idx = (idx + 1) % n; span.Add(pts[idx]); }
+                Curve seg = null;
+                if (span.Count == 2) seg = new LineCurve(span[0], span[1]);
+                else { try { seg = Curve.CreateInterpolatedCurve(span, 3); } catch { seg = null; } if (seg == null) seg = new PolylineCurve(span); }
+                if (seg != null && seg.IsValid) poly.Append(seg);
+            }
+            if (poly.SegmentCount == 0) return null;
+            poly.MakeClosed(1e-6);
+            return poly.IsValid ? (Curve)poly : null;
+        }
+
+        /// <summary>정리된 점들로 매끈한 '닫힌' 곡선 생성. 주기 보간 실패 시 열린 보간 후 닫기로 폴백.</summary>
+        private static Curve InterpClosed(List<Point3d> pts)
+        {
+            if (pts == null || pts.Count < 4) return null;
+            // 1순위: 주기(periodic) 보간 → 이음매까지 매끈(G2)
+            try
+            {
+                var c = Curve.CreateInterpolatedCurve(pts, 3, CurveKnotStyle.ChordPeriodic);
+                if (c != null && c.IsValid && c.IsClosed) return c;
+            }
+            catch { }
+            // 2순위: 시작점을 끝에 추가해 열린 보간 후 닫기 (이음매만 G0, 나머지 매끈)
+            try
+            {
+                var closedPts = new List<Point3d>(pts) { pts[0] };
+                var c = Curve.CreateInterpolatedCurve(closedPts, 3);
+                if (c != null && c.IsValid)
+                {
+                    if (!c.IsClosed) c.MakeClosed(1e-6);
+                    if (c.IsValid) return c;
+                }
+            }
+            catch { }
+            return null;
+        }
+
         private static Point3d[] SampleCurve(Curve c, double chord)
         {
             // 폴리라인이면 각 변을 chord로 분할하되 꼭짓점은 정확히 유지 (찌그러짐 방지)
@@ -2497,8 +2576,6 @@ namespace Plugin01
             // 셀을 표면에 안착시키기 위해 곡선을 미세 샘플(원점 정렬됨) → 정점마다 UV 오프셋으로 표면점 계산
             double chord = Math.Max(0.2, Math.Min(info.CellW, info.CellH) / 12.0);
             var repPts = SampleCurve(repCell, chord);
-            // 원본 셀이 매끈(tangent 연속)하면 표면 위 셀도 보간 곡선으로 → 두께면(로프트 옆면)이 분절되지 않게.
-            bool repSmooth = IsCurveSmoothClosed(repCell);
 
             double dedupDist = Math.Min(Pu, Pv) * 0.4;
             var occ = new Dictionary<long, List<Point3d>>();
@@ -2564,7 +2641,8 @@ namespace Plugin01
                     double delV = (a * f - b * e) / det;
                     mapped[k] = ((Surface)face).PointAt(u + delU, v + delV);
                 }
-                Curve crv = repSmooth ? BuildSmoothClosed(mapped) : null;
+                // 표면 위 점들을 매끈한 곡선으로 복원(급격한 코너만 보존) → 익스트루드 시 두께면 심(폴리곤 분절) 방지
+                Curve crv = BuildSmoothClosedPreservingCorners(mapped, 50.0);
                 if (crv == null || !crv.IsValid) crv = new PolylineCurve(mapped);
                 if (crv.IsValid) result.Add(crv);
             }

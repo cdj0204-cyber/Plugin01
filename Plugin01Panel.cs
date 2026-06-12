@@ -16,15 +16,14 @@ namespace Plugin01
     /// </summary>
     public class Plugin01Panel : Form
     {
-        private readonly Label _lblImport = new Label { Text = "(none)" };
+        private readonly Label _lblImport = new Label { Text = "(none)", Wrap = WrapMode.Word };
         private readonly Label _lblSurface = new Label { Text = "(none)" };
         private readonly Label _lblPattern = new Label { Text = "(using loaded SVG)" };
-        private readonly Label _lblStatus = new Label { Text = "" };
+        private readonly Label _lblStatus = new Label { Text = "", Wrap = WrapMode.Word };
         private readonly Label _lblPunchDir = new Label { Text = "Direction: World Z (default)" };
         private readonly Label _lblPunchCurves = new Label { Text = "(using last tiling result)" };
         private readonly CheckBox _wallOnly = new CheckBox { Text = "Punch selected wall only (protect opposite wall)", Checked = true };
-        private readonly CheckBox _punchAutoConnect = new CheckBox { Text = "Auto-connect punch walls", Checked = true };
-        private readonly Label _lblPunchFaces = new Label { Text = "Punch walls: (none → same as target faces)" };
+        // 천공 벽면 선택 기능 제거: 펀치 방향 + 커터 시작/끝단 길이로 깊이 조절. 천공 대상은 항상 대상 면(_faceIndices).
         private List<int> _punchFaceIndices = new List<int>();
         private readonly NumericStepper _safetyStart = new NumericStepper { Value = 1.0, MinValue = 0.0, MaxValue = 1000, DecimalPlaces = 1, Increment = 0.1, Width = 80 };
         private readonly NumericStepper _safetyEnd = new NumericStepper { Value = 1.0, MinValue = 0.0, MaxValue = 1000, DecimalPlaces = 1, Increment = 0.1, Width = 80 };
@@ -38,7 +37,6 @@ namespace Plugin01
         private Button _btnSurface; // 선택/해제 토글 버튼
         private Button _btnPattern; // 패턴 커브 직접 선택/해제 토글 버튼
         private Button _btnPreview; // 미리보기/지우기 토글 버튼
-        private Button _btnPunchFaces; // 천공 벽면 선택/해제 토글 버튼
         private Button _btnCutterPreview; // 커터 미리보기/지우기 토글 버튼
         private Button _btnInteractive;   // 패턴 위치 조절 (인터랙티브)
         private Button _btnPickPunchCurves; // 천공 커브 직접 선택
@@ -74,8 +72,13 @@ namespace Plugin01
         private StackLayout _rowOpenRatio;
         private readonly CheckBox _openRatioEnable = new CheckBox { Text = "Match open ratio" };
         private readonly NumericStepper _openRatioPct = new NumericStepper { Value = 30, MinValue = 0, MaxValue = 100, DecimalPlaces = 1, Increment = 1.0, Width = 70 };
-        private readonly Slider _openRatioSlider = new Slider { MinValue = 0, MaxValue = 100, Value = 30, TickFrequency = 10 };
+        private readonly Slider _openRatioSlider = new Slider { MinValue = 0, MaxValue = 100, Value = 30, TickFrequency = 10, Width = 180 };
         private bool _suppressOpenRatioSync = false; // 슬라이더↔숫자 입력 동기화 시 되먹임 방지
+        // RealSize 전용: 패턴 자체 크기 배율(%). 100 = 입력 패턴 실측 크기. 셀+간격을 함께 스케일.
+        private StackLayout _rowPatScale;
+        private readonly NumericStepper _patScalePct = new NumericStepper { Value = 100, MinValue = 10, MaxValue = 400, DecimalPlaces = 1, Increment = 5.0, Width = 70 };
+        private readonly Slider _patScaleSlider = new Slider { MinValue = 10, MaxValue = 400, Value = 100, TickFrequency = 10, Width = 180 };
+        private bool _suppressPatScaleSync = false;
         private readonly Label _lblOpenArea = new Label { Text = "Pattern Area: (preview first)" };
         private double _selectedFaceArea = 0; // 선택 면 합산 면적(mm²), 면 선택 시 갱신
         private double _lastPreviewArea = -1; // 마지막 미리보기 패턴 면적(mm²) — PartialFit 표시용
@@ -85,6 +88,7 @@ namespace Plugin01
         private List<Curve> _pattern = new List<Curve>();
         private Brep _targetBrep;
         private Guid _targetObjectId = Guid.Empty;       // 천공 대상 (실제 도큐먼트 객체)
+        private Guid _punchedObjectId = Guid.Empty;      // 누적 천공 결과 솔리드 (있으면 다음 천공의 대상이 됨)
         private List<int> _faceIndices = new List<int>();
         private List<Guid> _lastTiledIds = new List<Guid>(); // 마지막 타일링 확정 결과
         private Vector3d _punchDir = Vector3d.ZAxis;     // 관통 방향 (기본 World Z)
@@ -233,16 +237,16 @@ namespace Plugin01
         public Plugin01Panel()
         {
             Title = "Plugin 01 — Pattern Perforation";
-            ClientSize = new Size(400, 450);
+            ClientSize = new Size(440, 450);
             Topmost = true;
             Maximizable = false;
             Minimizable = false;
-            Resizable = true; // 세로는 자유롭게 늘림. 가로는 아래 SizeChanged 에서 400 으로 고정.
-            // 가로폭 400px 고정: 사용자가 폭을 바꾸면 즉시 400 으로 되돌림 (세로 높이는 유지)
+            Resizable = true; // 세로는 자유롭게 늘림. 가로는 아래 SizeChanged 에서 440 으로 고정.
+            // 가로폭 440px 고정: 사용자가 폭을 바꾸면 즉시 440 으로 되돌림 (세로 높이는 유지)
             SizeChanged += (s, e) =>
             {
-                if (ClientSize.Width != 400)
-                    ClientSize = new Size(400, ClientSize.Height);
+                if (ClientSize.Width != 440)
+                    ClientSize = new Size(440, ClientSize.Height);
             };
 
             var btnImport = new Button { Text = "Import" };
@@ -263,27 +267,25 @@ namespace Plugin01
             _ddMode.SelectedIndex = 0;
             _ddMode.SelectedIndexChanged += OnModeChanged;
 
-            // PartialFit 위치 고정 후 회전° 변경 → 같은 위치로 미리보기 실시간 갱신
-            _rotDegP.ValueChanged += (s2, e2) => RefreshPlacedPreview();
+            // PartialFit 회전° 변경 → 미리보기 실시간 갱신
+            _rotDegP.ValueChanged += (s2, e2) => LivePreviewRefresh();
 
-            // Scale% 슬라이더 ↔ 숫자입력 동기화 + (위치 고정 시) 미리보기 실시간 갱신
+            // Scale% 슬라이더 ↔ 숫자입력 동기화 + 미리보기 실시간 갱신 (동기화로 인한 중복 갱신 방지)
             _scaleSlider.ValueChanged += (s2, e2) =>
             {
                 if (_suppressScaleSync) return;
                 _suppressScaleSync = true;
                 _scalePct.Value = _scaleSlider.Value;
                 _suppressScaleSync = false;
-                RefreshPlacedPreview();
+                LivePreviewRefresh();
             };
             _scalePct.ValueChanged += (s2, e2) =>
             {
-                if (!_suppressScaleSync)
-                {
-                    _suppressScaleSync = true;
-                    _scaleSlider.Value = (int)Math.Round(Math.Max(_scaleSlider.MinValue, Math.Min(_scaleSlider.MaxValue, _scalePct.Value)));
-                    _suppressScaleSync = false;
-                }
-                RefreshPlacedPreview();
+                if (_suppressScaleSync) return; // 슬라이더가 유발한 동기화면 슬라이더 쪽에서 이미 갱신함
+                _suppressScaleSync = true;
+                _scaleSlider.Value = (int)Math.Round(Math.Max(_scaleSlider.MinValue, Math.Min(_scaleSlider.MaxValue, _scalePct.Value)));
+                _suppressScaleSync = false;
+                LivePreviewRefresh();
             };
 
             // RealSize 전용 알고리즘(전략) 선택 — 대상 표면에 따라 골라 타일링 성공률을 높임
@@ -344,7 +346,8 @@ namespace Plugin01
                 Visible = false
             };
 
-            // 개구율 맞춤: 체크박스(1줄) + [라벨 · 슬라이더 · 숫자입력](다음 줄). 슬라이더 0~100%.
+            // 개구율 맞춤: 체크박스 / 라벨 / [슬라이더 · 숫자 · Apply] (슬라이더는 라벨 아래 줄). 0~100%.
+            var btnOpenApply = new Button { Text = "Apply", Width = 56 };
             _rowOpenRatio = new StackLayout
             {
                 Orientation = Orientation.Vertical,
@@ -353,6 +356,7 @@ namespace Plugin01
                 Items =
                 {
                     _openRatioEnable,
+                    new Label { Text = "Target open ratio (%):" },
                     new StackLayout
                     {
                         Orientation = Orientation.Horizontal,
@@ -360,14 +364,14 @@ namespace Plugin01
                         VerticalContentAlignment = VerticalAlignment.Center,
                         Items =
                         {
-                            new Label { Text = "Target open ratio (%):" },
-                            new StackLayoutItem(_openRatioSlider, expand: true),
-                            _openRatioPct
+                            _openRatioSlider,
+                            _openRatioPct,
+                            btnOpenApply
                         }
                     }
                 }
             };
-            // 슬라이더 ↔ 숫자입력 동기화 + 개구 면적(mm²) 표시 갱신
+            // 슬라이더 드래그 → 숫자 동기화 + 즉시 반영(라이브). 숫자 직접 입력은 Apply 눌러야 반영(중간값 미리보기 방지).
             _openRatioSlider.ValueChanged += (s2, e2) =>
             {
                 if (_suppressOpenRatioSync) return;
@@ -375,18 +379,70 @@ namespace Plugin01
                 _openRatioPct.Value = _openRatioSlider.Value;
                 _suppressOpenRatioSync = false;
                 UpdateOpenAreaInfo();
+                LivePreviewRefresh();
             };
-            _openRatioPct.ValueChanged += (s2, e2) =>
+            btnOpenApply.Click += (s2, e2) =>
             {
-                if (!_suppressOpenRatioSync)
-                {
-                    _suppressOpenRatioSync = true;
-                    _openRatioSlider.Value = (int)Math.Round(Math.Max(0, Math.Min(100, _openRatioPct.Value)));
-                    _suppressOpenRatioSync = false;
-                }
+                _suppressOpenRatioSync = true;
+                _openRatioSlider.Value = (int)Math.Round(Math.Max(0, Math.Min(100, _openRatioPct.Value)));
+                _suppressOpenRatioSync = false;
                 UpdateOpenAreaInfo();
+                LivePreviewRefresh();
             };
-            _openRatioEnable.CheckedChanged += (s2, e2) => UpdateOpenAreaInfo();
+            _openRatioEnable.CheckedChanged += (s2, e2) => { UpdateOpenAreaInfo(); LivePreviewRefresh(); };
+
+            // RealSize 패턴 크기 배율: 라벨 / [슬라이더 · 숫자 · Apply] (슬라이더는 라벨 아래 줄). 개구율과 동일 방식.
+            var btnPatApply = new Button { Text = "Apply", Width = 56 };
+            _rowPatScale = new StackLayout
+            {
+                Orientation = Orientation.Vertical,
+                Spacing = 4,
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                Items =
+                {
+                    new Label { Text = "Pattern scale (%):" },
+                    new StackLayout
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 6,
+                        VerticalContentAlignment = VerticalAlignment.Center,
+                        Items =
+                        {
+                            _patScaleSlider,
+                            _patScalePct,
+                            btnPatApply
+                        }
+                    }
+                }
+            };
+            // 슬라이더 드래그 → 즉시 반영(라이브). 숫자 직접 입력은 Apply 눌러야 반영(중간값 미리보기 방지).
+            _patScaleSlider.ValueChanged += (s2, e2) =>
+            {
+                if (_suppressPatScaleSync) return;
+                _suppressPatScaleSync = true;
+                _patScalePct.Value = _patScaleSlider.Value;
+                _suppressPatScaleSync = false;
+                LivePreviewRefresh();
+            };
+            btnPatApply.Click += (s2, e2) =>
+            {
+                _suppressPatScaleSync = true;
+                _patScaleSlider.Value = (int)Math.Round(Math.Max(_patScaleSlider.MinValue, Math.Min(_patScaleSlider.MaxValue, _patScalePct.Value)));
+                _suppressPatScaleSync = false;
+                LivePreviewRefresh();
+            };
+
+            // 나머지 타일링 옵션도 미리보기 켜진 상태에서 변경 시 자동 반영
+            _ddStrategy.SelectedIndexChanged += (s2, e2) => LivePreviewRefresh();
+            _rotDeg.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _nu.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _nv.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _flipH.CheckedChanged += (s2, e2) => LivePreviewRefresh();
+            _flipV.CheckedChanged += (s2, e2) => LivePreviewRefresh();
+            _margin.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _uOff.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _vOff.ValueChanged += (s2, e2) => LivePreviewRefresh();
+            _fadeRings.ValueChanged += (s2, e2) => LivePreviewRefresh();
 
             // RealSize 전용 경계(초록선) 처리 방식
             _ddBoundary.Items.Add("Delete boundary cells");
@@ -409,7 +465,7 @@ namespace Plugin01
                 Visible = false
             };
             // Boundary 선택에 따라 Shrink rings 표시 (Shrink toward boundary = index 1 일 때만)
-            _ddBoundary.SelectedIndexChanged += (s2, e2) => { if (_rowShrinkRings != null) _rowShrinkRings.Visible = (_ddBoundary.SelectedIndex == 1); };
+            _ddBoundary.SelectedIndexChanged += (s2, e2) => { if (_rowShrinkRings != null) _rowShrinkRings.Visible = (_ddBoundary.SelectedIndex == 1); LivePreviewRefresh(); };
 
             _rowStrategy = new StackLayout
             {
@@ -443,8 +499,6 @@ namespace Plugin01
             _btnPickPunchCurves.Click += OnPickPunchCurves;
             var btnPickDir = new Button { Text = "Set Punch Direction" };
             btnPickDir.Click += OnPickDirection;
-            _btnPunchFaces = new Button { Text = "Select Punch Walls" };
-            _btnPunchFaces.Click += OnTogglePunchFaces;
             var rowDraft = new StackLayout
             {
                 Orientation = Orientation.Horizontal,
@@ -474,7 +528,7 @@ namespace Plugin01
             _btnInteractive = new Button { Text = "Adjust Pattern Position (interactive)" };
             _btnInteractive.Click += OnInteractivePlace;
 
-            var btnTile = new Button { Text = "Apply Tiling (commit)" };
+            var btnTile = new Button { Text = "Bake Pattern" };
             btnTile.Click += OnApply;
 
             Closed += (s, e) => DisableAllPreview();
@@ -510,8 +564,7 @@ namespace Plugin01
                 Header = StepHeader(_ind4, "4. Punch Hole"),
                 Expanded = false,
                 Content = StepBody(
-                    _wallOnly, _punchAutoConnect,
-                    _btnPunchFaces, _lblPunchFaces,
+                    _wallOnly,
                     _btnPickPunchCurves, _lblPunchCurves, btnPickDir, _lblPunchDir, rowDraft, rowSafety,
                     _btnCutterPreview, btnPunch)
             };
@@ -732,10 +785,11 @@ namespace Plugin01
                 _detailStack.Items.Add(_rowCounts);
                 _detailStack.Items.Add(_rowFlips);
             }
-            else if (m == 1) // RealSize: 회전 / 경계 / 개구율
+            else if (m == 1) // RealSize: 회전 / 경계 / 패턴 크기 / 개구율
             {
                 _detailStack.Items.Add(_rowRotation);
                 _detailStack.Items.Add(_rowBoundary);
+                _detailStack.Items.Add(_rowPatScale);
                 _detailStack.Items.Add(_rowOpenRatio);
             }
             else // PartialFit: 회전·이동·Scale(2x2 그리드) / 경계
@@ -748,12 +802,14 @@ namespace Plugin01
             // 컨테이너에 들어간 행들은 보이도록
             _rowRotation.Visible = true; _rowCounts.Visible = true; _rowFlips.Visible = true;
             _rowPartial.Visible = true; _rowBoundary.Visible = true; _rowOpenRatio.Visible = true;
+            if (_rowPatScale != null) _rowPatScale.Visible = true;
             if (_rowShrinkRings != null) _rowShrinkRings.Visible = (_ddBoundary.SelectedIndex == 1);
 
             _lastPreviewArea = -1;
             _placeRecompute = null; _placeCenter = null; // 모드 바뀌면 인터랙티브 배치 무효화
             UpdateOpenAreaInfo();
             ReapplyWpfStyles(); // 새로 추가된 슬라이더(Scale/개구율)에 흰 원형 토글·파랑 채움·눈금제거 스타일 적용
+            LivePreviewRefresh(); // 미리보기 켜진 상태에서 모드 바뀌면 새 모드로 다시 계산
         }
 
         private void OnImport(object sender, EventArgs e)
@@ -837,6 +893,7 @@ namespace Plugin01
 
             _targetBrep = first.Brep.DuplicateBrep();
             _targetObjectId = go.Object(0).ObjectId;
+            _punchedObjectId = Guid.Empty; // 새 대상 → 누적 천공 이력 초기화
 
             if (auto)
             {
@@ -1099,6 +1156,25 @@ namespace Plugin01
                 : "Pattern Area: (preview first)";
         }
 
+        // 패턴 전체를 원점 기준 균일 스케일(셀 크기 + 간격을 함께 배율). factor=1 이면 원본 복제.
+        private static List<Curve> ScalePatternCurves(IList<Curve> src, double factor)
+        {
+            var outp = new List<Curve>(src.Count);
+            if (Math.Abs(factor - 1.0) < 1e-9)
+            {
+                foreach (var c in src) outp.Add(c.DuplicateCurve());
+                return outp;
+            }
+            var xf = Transform.Scale(Point3d.Origin, factor);
+            foreach (var c in src)
+            {
+                var d = c.DuplicateCurve();
+                d.Transform(xf);
+                outp.Add(d);
+            }
+            return outp;
+        }
+
         // 개구율 맞춤: 목표 개구율(%)에 맞게 각 구멍을 "자기 중심" 기준으로 2D 스케일(간격 유지).
         // 끄면 원본 그대로 반환. achievedPct = 적용된 목표 개구율(%) (미적용 시 -1).
         // 개구율 = 구멍면적 / 셀면적(pitch 기반, 실패 시 패턴 bbox 기반).
@@ -1163,7 +1239,12 @@ namespace Plugin01
             // 개구율 맞춤: RealSize 만 적용. Stretch/PartialFit 은 실제 생성 패턴 면적만 표시(개구율 미적용).
             double openAchieved = -1;
             List<Curve> pattern;
-            if (m == 1) pattern = ApplyOpenRatio(_pattern, out openAchieved);
+            if (m == 1)
+            {
+                // 패턴 크기 배율을 먼저 적용(셀+간격 함께 스케일) → 그 위에 개구율 보정
+                var basePat = ScalePatternCurves(_pattern, Math.Max(0.0001, _patScalePct.Value / 100.0));
+                pattern = ApplyOpenRatio(basePat, out openAchieved);
+            }
             else pattern = new List<Curve>(_pattern);
             string orInfo = openAchieved >= 0 ? $", open ratio ~{openAchieved:0.#}%" : "";
 
@@ -1218,7 +1299,7 @@ namespace Plugin01
                         all.AddRange(SurfaceTiler.TileConnectedRealSizeFit(_targetBrep, _faceIndices, info, refDirR, angleTolR, _rotDeg.Value, _ddBoundary.SelectedIndex, (int)_fadeRings.Value, marginR));
                     }
                     string stratName = (strat == 1) ? "Strategy 2 (planar grid)" : (strat == 2) ? "Strategy 3 (UV march)" : "Strategy 1 (surface walk)";
-                    SetStatus($"Analysis [{stratName}]: cell {info.CellW:0.#}x{info.CellH:0.#}, rotation {_rotDeg.Value:0.#}° → {all.Count} cells{orInfo}");
+                    SetStatus($"Analysis [{stratName}]: cell {info.CellW:0.#}x{info.CellH:0.#}, scale {_patScalePct.Value:0.#}%, rotation {_rotDeg.Value:0.#}° → {all.Count} cells{orInfo}");
                     return all;
                 }
                 catch (Exception ex) { SetStatus("Placement failed: " + ex.Message); return null; }
@@ -1353,6 +1434,27 @@ namespace Plugin01
                 UpdatePreviewButtonText();
                 RhinoDoc.ActiveDoc?.Views.Redraw();
             }
+        }
+
+        // 미리보기가 켜져 있을 때 타일링 옵션을 바꾸면 자동으로 다시 계산해 갱신한다.
+        // (지우고 'Preview' 를 다시 누를 필요 없이 실시간 반영)
+        private void LivePreviewRefresh()
+        {
+            if (_preview == null || _preview.Curves == null || _preview.Curves.Count == 0) return;
+
+            // PartialFit 에서 인터랙티브로 위치를 고정해 둔 경우엔 그 위치 기준으로 갱신
+            if (_ddMode.SelectedIndex == 2 && _placeRecompute != null)
+            {
+                RefreshPlacedPreview();
+                return;
+            }
+
+            var tiled = ComputeTiling();
+            if (tiled == null || tiled.Count == 0) return;
+            _preview.Curves = tiled;
+            _preview.Enabled = true;
+            UpdatePreviewButtonText();
+            RhinoDoc.ActiveDoc?.Views.Redraw();
         }
 
         // 미리보기 커브가 떠 있는지에 따라 버튼 텍스트 갱신
@@ -1776,88 +1878,12 @@ namespace Plugin01
         }
 
         // 천공 벽면 선택 여부에 따라 버튼 텍스트 갱신
-        private void UpdatePunchFacesButtonText()
-        {
-            bool has = _punchFaceIndices != null && _punchFaceIndices.Count > 0;
-            if (_btnPunchFaces != null) _btnPunchFaces.Text = has ? "Clear Punch Walls" : "Select Punch Walls";
-            SetButtonActive(_btnPunchFaces, has);
-        }
-
-        // 하나의 버튼으로 천공 벽면 선택/해제 토글
-        private void OnTogglePunchFaces(object sender, EventArgs e)
-        {
-            bool has = _punchFaceIndices != null && _punchFaceIndices.Count > 0;
-            if (has) OnClearPunchFaces(sender, e);
-            else OnPickPunchFaces(sender, e);
-        }
-
-        private void OnPickPunchFaces(object sender, EventArgs e)
-        {
-            if (_targetBrep == null)
-            {
-                SetStatus("Please 'Select Target Faces' first.");
-                return;
-            }
-            bool auto = _punchAutoConnect.Checked == true;
-
-            var go = new GetObject();
-            go.SetCommandPrompt(auto ? "Select punch wall (auto-collect connected)" : "Pick punch walls (multiple)");
-            go.GeometryFilter = ObjectType.Surface;
-            go.SubObjectSelect = true;
-            go.EnablePreSelect(false, true);
-
-            GetResult res = auto ? go.Get() : go.GetMultiple(1, 0);
-            if (res != GetResult.Object) { SetStatus("Punch wall selection cancelled"); return; }
-
-            // 같은 brep 객체에서 선택해야 함
-            if (go.Object(0).ObjectId != _targetObjectId)
-            {
-                SetStatus("Must select from the same object as the target.");
-                return;
-            }
-
-            var indices = new List<int>();
-            if (auto)
-            {
-                var first = go.Object(0).Face();
-                if (first == null) { SetStatus("Failed to get face"); return; }
-                double angleTol = RhinoDoc.ActiveDoc?.ModelAngleToleranceRadians ?? RhinoMath.ToRadians(1);
-                indices = FaceGrouping.GrowTangent(_targetBrep, first.FaceIndex, angleTol);
-                _lblPunchFaces.Text = $"Punch walls: auto-connected {indices.Count}";
-                SetStatus($"{indices.Count} punch walls (auto-connected)");
-            }
-            else
-            {
-                for (int i = 0; i < go.ObjectCount; i++)
-                {
-                    var oref = go.Object(i);
-                    if (oref.ObjectId != _targetObjectId) continue;
-                    var f = oref.Face();
-                    if (f != null && !indices.Contains(f.FaceIndex)) indices.Add(f.FaceIndex);
-                }
-                _lblPunchFaces.Text = $"Punch walls: picked {indices.Count}";
-                SetStatus($"{indices.Count} punch walls (picked)");
-            }
-            _punchFaceIndices = indices;
-            AutoSetPunchDir(indices); // 선택한 벽면 법선으로 관통 방향 자동 설정
-            UpdatePunchFacesButtonText();
-            UpdatePunchOutlinePreview();
-        }
-
-        private void OnClearPunchFaces(object sender, EventArgs e)
-        {
-            _punchFaceIndices = new List<int>();
-            _lblPunchFaces.Text = "Punch walls: (none → same as target faces)";
-            AutoSetPunchDir(_faceIndices); // 대상 표면 법선으로 방향 복귀 (fallback)
-            UpdatePunchFacesButtonText();
-            SetStatus("Punch walls cleared");
-            UpdatePunchOutlinePreview();
-        }
 
         private void OnClearTargetSurface(object sender, EventArgs e)
         {
             _targetBrep = null;
             _targetObjectId = Guid.Empty;
+            _punchedObjectId = Guid.Empty; // 누적 천공 이력 초기화
             _faceIndices = new List<int>();
             _lblSurface.Text = "No faces selected";
             _placeRecompute = null; _placeCenter = null; // 대상 바뀌면 인터랙티브 배치 무효화
@@ -1984,6 +2010,16 @@ namespace Plugin01
             Brep targetBrep; List<Curve> punchCurves; List<int> punchFaces; double tol; bool wallOnly;
             if (!TryGetPunchInputs(out targetBrep, out punchCurves, out punchFaces, out tol, out wallOnly)) return;
 
+            // 누적 천공: 이미 뚫린 결과가 있으면 그것을 대상으로 계속 뚫는다 (2번 나눠 뚫어도 한 솔리드로 누적).
+            bool accumulating = false;
+            if (_punchedObjectId != Guid.Empty)
+            {
+                var prev = doc.Objects.FindId(_punchedObjectId);
+                var pb = (prev?.Geometry as Brep)?.DuplicateBrep();
+                if (pb != null) { targetBrep = pb; accumulating = true; }
+                else _punchedObjectId = Guid.Empty; // 사용자가 결과를 지웠으면 이력 버림
+            }
+
             double safS = _safetyStart.Value;
             double safE = _safetyEnd.Value;
             double draft = _draftDeg.Value;
@@ -2004,16 +2040,23 @@ namespace Plugin01
                 return;
             }
 
-            // 결과를 도큐먼트에 추가하고 원본은 숨김
+            // 결과를 도큐먼트에 추가
             int gi = doc.Groups.Add("perforated");
             var attr = new ObjectAttributes { Name = "perforated" };
             attr.AddToGroup(gi);
-            foreach (var b in res.Breps) doc.Objects.AddBrep(b, attr);
-            doc.Objects.Hide(_targetObjectId, true);
-            doc.Views.Redraw();
+            var newIds = new List<Guid>();
+            foreach (var b in res.Breps) { var id = doc.Objects.AddBrep(b, attr); if (id != Guid.Empty) newIds.Add(id); }
 
+            // 직전 단계 정리: 누적 중이면 이전 결과 솔리드를 삭제, 처음 천공이면 원본을 숨김
+            if (accumulating) doc.Objects.Delete(_punchedObjectId, true);
+            else doc.Objects.Hide(_targetObjectId, true);
+
+            // 다음 천공이 누적되도록 결과를 추적 (정상 천공은 솔리드 1개; 여러 개면 누적 추적 해제)
+            _punchedObjectId = (newIds.Count == 1) ? newIds[0] : Guid.Empty;
+
+            doc.Views.Redraw();
             SetStepDone(4, true);
-            SetStatus($"Perforation done [{res.Stage}]: success {res.SuccessCount}/{res.CutterCount} (fallback {res.FallbackCount}, failed {res.FailedCount}, no-wall {res.NoWallCount}) — draft {draft:0.0}°");
+            SetStatus($"Perforation done [{res.Stage}]{(accumulating ? " +accumulated" : "")}: success {res.SuccessCount}/{res.CutterCount} (fallback {res.FallbackCount}, failed {res.FailedCount}, no-wall {res.NoWallCount}) — draft {draft:0.0}°");
         }
     }
 }

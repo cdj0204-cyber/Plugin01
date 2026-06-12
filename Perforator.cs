@@ -18,6 +18,9 @@ namespace Plugin01
         /// <summary>Cutter 가 벽면을 넘어 최소로 더 연장되는 거리 (mm). Coincident-face 로 인한 boolean 오류 회피.</summary>
         public const double DefaultSafetyMm = 1.0;
 
+        /// <summary>벽 두께를 못 찾았을 때 커브를 중심으로 생성하는 기본 커터 깊이 (mm). 이후 Extend Start/End 로 조절.</summary>
+        public const double DefaultCutDepth = 4.0;
+
         public class Result
         {
             public Brep[] Breps;
@@ -86,7 +89,16 @@ namespace Plugin01
                     else
                         spanOk = TryFindNearestWallSpan(target, cellCenter, direction, tolerance, diag, cellTMin, cellTMax, safetyStart, safetyEnd, out basePt, out len);
 
-                    if (!spanOk) { res.NoWallCount++; continue; }
+                    // 벽 두께 구간을 못 찾아도 커터는 만든다: 커브를 중심으로 기본 깊이(DefaultCutDepth)만큼만.
+                    // 커브가 코어 중앙에 오도록 배치 → 방향 부호와 무관하게 표면을 가로질러 항상 절단.
+                    // 이후 사용자가 Cutter Extend Start/End 로 양 끝을 늘려 깊이를 조절.
+                    if (!spanOk)
+                    {
+                        res.NoWallCount++;
+                        double half = DefaultCutDepth * 0.5;
+                        basePt = cellCenter - direction * (safetyStart + half);
+                        len = safetyStart + DefaultCutDepth + safetyEnd;
+                    }
                 }
                 else
                 {
